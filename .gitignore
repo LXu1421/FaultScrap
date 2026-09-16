@@ -1,0 +1,47 @@
+# Python virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env/
+.python-version
+
+# Common local/project temp/cache folders
+.dumate/
+.dumate*
+.tmp/
+.temp/
+.cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter / editor / OS noise
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Data / outputs that are generated locally
+outputs/
+out/
+build/
+dist/
+logs/
+*.log
+
+# Optional: ignore common package manager folders
+node_modules/
+.conda/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Keep the repository itself tracked; do not ignore project source files
+# (This file intentionally does not exclude *.py, *.md, etc.)
+doc/
+code_old/
+test&logs/
+data/
