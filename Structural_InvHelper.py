@@ -10,10 +10,8 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 STRUCTURAL_POINTS_DIR = Path(r"data\Extracted_Fault_Feature_Attribute")
 STRUCTURAL_POINT_FILES = [
-    STRUCTURAL_POINTS_DIR / "CWvic1.txt",
-    STRUCTURAL_POINTS_DIR / "FSD1.txt",
-    STRUCTURAL_POINTS_DIR / "GeoStru2501.txt",
-    STRUCTURAL_POINTS_DIR / "GeoStru501.txt"]
+    STRUCTURAL_POINTS_DIR / "NFD1.txt",
+    STRUCTURAL_POINTS_DIR / "FSD1.txt"]
 
 OUTPUT_DIR = Path(r"data")
 

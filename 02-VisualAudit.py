@@ -72,14 +72,16 @@ DERIV_DIR = DATA_DIR / "derivatives"
 OUT_DIR   = DERIV_DIR / "visual_audit"
 
 # DEM paths (reprojected to EPSG:28355)
-SRTM_RP   = DERIV_DIR / "srtm1s_epsg28355.tif"
-DEM10M_RP = DERIV_DIR / "dem10m_epsg28355.tif"
-LIDAR_RP  = DERIV_DIR / "lidar_0_5m_epsg28355.tif"
+SRTM3S_RP  = DERIV_DIR / "srtm3s_epsg28355.tif"
+SRTM_RP    = DERIV_DIR / "srtm1s_epsg28355.tif"
+DEM10M_RP  = DERIV_DIR / "dem10m_epsg28355.tif"
+LIDAR_RP   = DERIV_DIR / "lidar_0_5m_epsg28355.tif"
 
 # Derivative sub-directories
-SRTM_DERIV   = DERIV_DIR / "srtm1s"
-DEM10M_DERIV = DERIV_DIR / "dem10m"
-LIDAR_DERIV  = DERIV_DIR / "lidar_0_5m"
+SRTM3S_DERIV  = DERIV_DIR / "srtm3s"
+SRTM_DERIV    = DERIV_DIR / "srtm1s"
+DEM10M_DERIV  = DERIV_DIR / "dem10m"
+LIDAR_DERIV   = DERIV_DIR / "lidar_0_5m"
 
 # Phase 1 audit outputs
 AUDIT_DIR = DERIV_DIR / "phase1_audit"
@@ -112,6 +114,7 @@ KOREAN_SCARP_RANGE   = (2.0, 4.0)
 
 # Minimum detectable scarp height per DEM resolution
 MIN_DETECTABLE_SCARP = {
+    90.0: 9.0,   # SRTM 3s (~90m), coarser than 1s
     30.0: 3.0,   # SRTM ~6m RMSE vertical, can resolve ~3m
     10.0: 1.0,   # GA 10m DEM
     0.5:  0.2,   # LiDAR 0.5m
@@ -2568,13 +2571,22 @@ def plot_hypsometric_curves(dem_path, traces, out_dir, nodata=None,
 def plot_confidence_heatmap(dem_paths, out_fig_path, nodata=None):
     """
     Confidence heatmap showing spatial data density:
-      - LiDAR coverage extent vs. 30m-only coverage
+      - LiDAR coverage extent vs. 30m-only coverage vs. 90m-only coverage
       - Makes data-quality gaps immediately visible
+
+    Coverage levels:
+      0 = no data
+      1 = SRTM 3s only (~90m)
+      2 = SRTM 1s + 3s (~30m)
+      3 = GA 10m + SRTM 1s + 3s
+      4 = LiDAR 0.5m + 10m + SRTM
     """
     print(f"\n[Confidence Heatmap] Data density / coverage")
 
-    # Use SRTM as reference grid (lowest resolution = widest extent)
-    with rasterio.open(dem_paths["srtm1s"]) as src:
+    # Use SRTM 3s as reference grid (lowest resolution = widest extent);
+    # fall back to SRTM 1s if 3s is not available.
+    ref_key = "srtm3s" if "srtm3s" in dem_paths else "srtm1s"
+    with rasterio.open(dem_paths[ref_key]) as src:
         ref_shape = (src.height, src.width)
         ref_transform = src.transform
         ref_bounds = src.bounds
@@ -2582,13 +2594,40 @@ def plot_confidence_heatmap(dem_paths, out_fig_path, nodata=None):
 
     coverage = np.zeros(ref_shape, dtype=np.float32)
 
-    # SRTM valid pixels
-    with rasterio.open(dem_paths["srtm1s"]) as src:
-        srtm = src.read(1).astype(np.float32)
-        valid_srtm = (srtm != -999.0) & (srtm > -1e6) & (~np.isnan(srtm))
-        coverage[valid_srtm] = 1.0
+    # SRTM 3s valid pixels (level 1)
+    if "srtm3s" in dem_paths and Path(dem_paths["srtm3s"]).exists():
+        with rasterio.open(dem_paths["srtm3s"]) as src:
+            srtm3s = src.read(1).astype(np.float32)
+            nd3s = src.nodata if src.nodata is not None else -32768.0
+            valid_srtm3s = (srtm3s != nd3s) & (srtm3s > -1e6) & (~np.isnan(srtm3s))
+            coverage[valid_srtm3s] = 1.0
 
-    # 10m DEM valid pixels (resample to SRTM grid)
+    # SRTM 1s valid pixels (level 2)
+    if "srtm1s" in dem_paths and Path(dem_paths["srtm1s"]).exists():
+        try:
+            srtm1s_valid = np.zeros(ref_shape, dtype=np.float32)
+            with rasterio.open(dem_paths["srtm1s"]) as src:
+                srtm1s_mask = np.zeros((src.height, src.width), dtype=np.float32)
+                srtm1s = src.read(1).astype(np.float32)
+                nd1s = src.nodata if src.nodata is not None else -999.0
+                valid_block = ((srtm1s != nd1s) & (srtm1s > -1e6) &
+                               (~np.isnan(srtm1s))).astype(np.float32)
+                srtm1s_mask[:] = valid_block
+                reproject(
+                    source=srtm1s_mask,
+                    destination=srtm1s_valid,
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=ref_transform,
+                    dst_crs=TARGET_CRS,
+                    resampling=Resampling.nearest,
+                )
+                del srtm1s_mask, srtm1s, valid_block
+            coverage[srtm1s_valid > 0.5] = 2.0
+        except Exception as e:
+            print(f"  [!] Could not process SRTM 1s for coverage: {e}")
+
+    # 10m DEM valid pixels (resample to reference grid)
     if "dem10m" in dem_paths and Path(dem_paths["dem10m"]).exists():
         try:
             dem10m_valid = np.zeros(ref_shape, dtype=np.float32)
@@ -2614,7 +2653,7 @@ def plot_confidence_heatmap(dem_paths, out_fig_path, nodata=None):
                     resampling=Resampling.nearest,
                 )
                 del dem10m_mask
-            coverage[dem10m_valid > 0.5] = 2.0
+            coverage[dem10m_valid > 0.5] = 3.0
         except Exception as e:
             print(f"  [!] Could not process 10m DEM for coverage: {e}")
 
@@ -2657,7 +2696,7 @@ def plot_confidence_heatmap(dem_paths, out_fig_path, nodata=None):
                         resampling=Resampling.nearest,
                     )
                     del lidar_mask
-            coverage[lidar_valid > 0.5] = 3.0
+            coverage[lidar_valid > 0.5] = 4.0
         except Exception as e:
             print(f"  [!] Could not process LiDAR for coverage: {e}")
 
@@ -2668,12 +2707,14 @@ def plot_confidence_heatmap(dem_paths, out_fig_path, nodata=None):
     fig, ax = plt.subplots(1, 1, figsize=(16, 12))
 
     cmap = LinearSegmentedColormap.from_list("coverage",
-        [(0, "#FFFFFF"), (0.33, "#AED6F1"), (0.66, "#2E86C1"), (1.0, "#1B4F72")])
+        [(0, "#FFFFFF"), (0.25, "#D5F5E3"), (0.5, "#AED6F1"),
+         (0.75, "#2E86C1"), (1.0, "#1B4F72")])
 
     im = ax.imshow(coverage_smooth, cmap=cmap, extent=extent, aspect="equal",
-                    vmin=0, vmax=3, origin="upper")
-    cbar = fig.colorbar(im, ax=ax, shrink=0.7, ticks=[0, 1, 2, 3])
-    cbar.set_ticklabels(["No data", "SRTM 30m only", "GA 10m + SRTM",
+                    vmin=0, vmax=4, origin="upper")
+    cbar = fig.colorbar(im, ax=ax, shrink=0.7, ticks=[0, 1, 2, 3, 4])
+    cbar.set_ticklabels(["No data", "SRTM 3s 90m only",
+                          "SRTM 1s 30m + 3s", "GA 10m + SRTM",
                           "LiDAR 0.5m + 10m + SRTM"])
 
     ax.set_xlabel("Easting (m, EPSG:28355)", fontsize=10)
@@ -2689,12 +2730,13 @@ def plot_confidence_heatmap(dem_paths, out_fig_path, nodata=None):
 
 
 def plot_multi_resolution_comparison(dem_paths, traces, out_dir,
+                                     nodata_srtm3s=-32768.0,
                                      nodata_srtm=-999.0, nodata_10m=-3.4e38,
                                      nodata_lidar=-9999.0, n_tiles=5,
                                      struct_pts=None, fault_proximity_m=500):
     """
     Multi-resolution comparison panels: side-by-side tile panels showing
-    the same fault location at 30m, 10m, and 0.5m resolution.
+    the same fault location at 90m, 30m, 10m, and 0.5m resolution.
 
     Supports fault-aware tile selection: prioritises tiles near fault traces.
     Always uses windowed reads for LiDAR (42.8 GB).
@@ -2702,7 +2744,7 @@ def plot_multi_resolution_comparison(dem_paths, traces, out_dir,
     print(f"\n[Multi-Resolution Comparison] {n_tiles} tiles")
     safe_makedirs(out_dir)
 
-    # Fault-aware tile selection: prioritise traces with structural points nearby
+    # Fault-aware tile selection: prioritises traces with structural points nearby
     rng = np.random.default_rng(42)
 
     # Score traces by proximity to structural points
@@ -2732,7 +2774,20 @@ def plot_multi_resolution_comparison(dem_paths, traces, out_dir,
         labels = []
         extents_list = []
 
-        # SRTM
+        # SRTM 3s (~90m)
+        if "srtm3s" in dem_paths and Path(dem_paths["srtm3s"]).exists():
+            try:
+                srtm3s_tile, srtm3s_tf, srtm3s_bounds, _ = load_raster_window(
+                    dem_paths["srtm3s"], cx, cy, half, nodata=nodata_srtm3s)
+                panels.append(srtm3s_tile)
+                labels.append("SRTM 90m")
+                extents_list.append(srtm3s_bounds)
+            except Exception:
+                panels.append(None)
+                labels.append("SRTM 90m (N/A)")
+                extents_list.append(None)
+
+        # SRTM 1s (~30m)
         try:
             srtm_tile, srtm_tf, srtm_bounds, _ = load_raster_window(
                 dem_paths["srtm1s"], cx, cy, half, nodata=nodata_srtm)
@@ -3031,6 +3086,9 @@ def main():
     print("=" * 80)
     print(f"Available RAM: {mem_gb():.1f} GB")
 
+    # ---- TEST MODE: only process SRTM 3s, skip all other DEMs ----
+    TEST_ONLY_SRTM3S = True
+
     safe_makedirs(OUT_DIR)
 
     # -- Load data from Phase 1 outputs --
@@ -3041,9 +3099,11 @@ def main():
         print("[!] Structural points file not found")
         return
 
-    # Get SRTM extent for filtering
-    if SRTM_RP.exists():
-        with rasterio.open(SRTM_RP) as src:
+    # Get SRTM 3s or SRTM 1s extent for filtering
+    _extent_dem = SRTM3S_RP if (TEST_ONLY_SRTM3S and SRTM3S_RP.exists()) else (
+        SRTM_RP if SRTM_RP.exists() else None)
+    if _extent_dem is not None and _extent_dem.exists():
+        with rasterio.open(_extent_dem) as src:
             b = src.bounds
             extent = (b.left, b.right, b.bottom, b.top)
     else:
@@ -3059,15 +3119,23 @@ def main():
 
     # -- DEMs to process --
     dems = {}
-    if SRTM_RP.exists():
+    if not TEST_ONLY_SRTM3S and SRTM3S_RP.exists():
+        dems["srtm3s"] = {"path": SRTM3S_RP, "deriv": SRTM3S_DERIV, "res": 90.0,
+                           "nodata": -32768.0}
+    if not TEST_ONLY_SRTM3S and SRTM_RP.exists():
         dems["srtm1s"] = {"path": SRTM_RP, "deriv": SRTM_DERIV, "res": 30.0,
                            "nodata": -999.0}
-    if DEM10M_RP.exists():
+    if not TEST_ONLY_SRTM3S and DEM10M_RP.exists():
         dems["dem10m"] = {"path": DEM10M_RP, "deriv": DEM10M_DERIV, "res": 10.0,
                            "nodata": -3.4e38}
-    if LIDAR_RP.exists():
+    if not TEST_ONLY_SRTM3S and LIDAR_RP.exists():
         dems["lidar_0_5m"] = {"path": LIDAR_RP, "deriv": LIDAR_DERIV, "res": 0.5,
                                "nodata": -9999.0}
+
+    # In test mode, force only srtm3s
+    if TEST_ONLY_SRTM3S and SRTM3S_RP.exists():
+        dems = {"srtm3s": {"path": SRTM3S_RP, "deriv": SRTM3S_DERIV, "res": 90.0,
+                            "nodata": -32768.0}}
 
     print(f"\n  DEMs available for visual audit: {list(dems.keys())}")
 
@@ -3288,6 +3356,8 @@ def main():
 
     # Confidence heatmap
     dem_paths = {}
+    if SRTM3S_RP.exists():
+        dem_paths["srtm3s"] = str(SRTM3S_RP)
     if SRTM_RP.exists():
         dem_paths["srtm1s"] = str(SRTM_RP)
     if DEM10M_RP.exists():

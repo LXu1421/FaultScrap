@@ -25,6 +25,9 @@ from derivative_common import *
 def main():
     """Step 1-2: Reproject, align, and generate all DEM derivatives."""
 
+    # ---- TEST MODE: only process SRTM 3s, skip all other DEMs ----
+    TEST_ONLY_SRTM3S = False
+
     # -- Resource detection (GPU auto-detected) --
     res_obj = get_resources()
     safe_makedirs(OUT_DIR)
@@ -33,33 +36,38 @@ def main():
     # -- Step 1: Identify which DEMs to process --
     dems_to_process = {}
 
+    # SRTM 3s (~90 m)
+    if SRTM3S_PATH.exists():
+        print(f"\n{'-'*60}")
+        print(f"SRTM 3-arc-second: {SRTM3S_PATH.name}")
+        rp, nd = load_reprojected("srtm3s", SRTM3S_PATH, OUT_DIR)
+        dems_to_process["srtm3s"] = {"path": rp, "nodata": nd, "label": "SRTM 3s (~90 m)"}
+    else:
+        print(f"[!] SRTM 3s not found: {SRTM3S_PATH}")
+
     # SRTM 1s (~30 m)
-    if SRTM_PATH.exists():
+    if not TEST_ONLY_SRTM3S and SRTM_PATH.exists():
         print(f"\n{'-'*60}")
         print(f"SRTM 1-arc-second: {SRTM_PATH.name}")
         rp, nd = load_reprojected("srtm1s", SRTM_PATH, OUT_DIR)
         dems_to_process["srtm1s"] = {"path": rp, "nodata": nd, "label": "SRTM 1s (~30 m)"}
-    else:
+    elif not TEST_ONLY_SRTM3S:
         print(f"[!] SRTM not found: {SRTM_PATH}")
 
     # DEM 10 m
-    if DEM10M_PATH.exists():
+    if not TEST_ONLY_SRTM3S and DEM10M_PATH.exists():
         print(f"\n{'-'*60}")
         print(f"GA 10 m DEM: {DEM10M_PATH.name}")
         rp, nd = load_reprojected("dem10m", DEM10M_PATH, OUT_DIR)
         dems_to_process["dem10m"] = {"path": rp, "nodata": nd, "label": "GA 10 m DEM"}
-    else:
+    elif not TEST_ONLY_SRTM3S:
         print(f"[!] DEM10m not found: {DEM10M_PATH}")
 
-    # LiDAR 0.5 m
-    if LIDAR_PATH.exists():
-        print(f"\n{'-'*60}")
-        print(f"LiDAR 0.5 m: {LIDAR_PATH.name}")
-        rp, nd = load_reprojected("lidar_0_5m", LIDAR_PATH, OUT_DIR)
-        dems_to_process["lidar_0_5m"] = {"path": rp, "nodata": LIDAR_NODATA,
-                                           "label": "LiDAR 0.5 m"}
-    else:
-        print(f"[!] LiDAR not found: {LIDAR_PATH}")
+    # LiDAR 0.5 m -- SKIPPED (70 GB reprojection too slow for this run)
+    if not TEST_ONLY_SRTM3S and LIDAR_PATH.exists():
+         rp, nd = load_reprojected("lidar_0_5m", LIDAR_PATH, OUT_DIR)
+         dems_to_process["lidar_0_5m"] = {"path": rp, "nodata": LIDAR_NODATA,
+                                            "label": "LiDAR 0.5 m"}
 
     print(f"\n{'='*60}")
     print(f"DEMs ready for derivative generation: {len(dems_to_process)}")
@@ -67,8 +75,10 @@ def main():
         print(f"  {k}: {v['path'].name}  (nodata={v['nodata']})")
     print(f"{'='*60}")
 
-    # -- Step 1b: Clip all DEMs to common extent (aligned with LiDAR) --
-    dems_to_process = clip_to_common_extent(dems_to_process, OUT_DIR, reference_key="lidar_0_5m")
+    # -- Step 1b: Clip all DEMs to common extent (aligned with reference) --
+    # Without LiDAR, use srtm3s as reference
+    ref_key = "srtm3s" if TEST_ONLY_SRTM3S else "srtm3s"
+    dems_to_process = clip_to_common_extent(dems_to_process, OUT_DIR, reference_key=ref_key)
 
     print(f"\n{'='*60}")
     print(f"DEMs after alignment: {len(dems_to_process)}")

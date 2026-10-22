@@ -329,6 +329,7 @@ OUT_DIR  = DATA_DIR / "derivatives"
 
 # Input DEM paths
 SRTM_PATH   = DATA_DIR / "srtm1s_axe.tif"
+SRTM3S_PATH = DATA_DIR / "srtm3s_axe.tif"
 DEM10M_PATH = DATA_DIR / "Dem10m_axe.tif"
 LIDAR_PATH  = DATA_DIR / "axedale_2020nov01_dem50cm_v10cm_epsg7855.tif"
 
@@ -921,7 +922,10 @@ def load_reprojected(dem_key, src_path, out_dir):
         os.remove(version_path)
 
     # Determine target resolution based on DEM type
-    if "srtm" in dem_key.lower() or "1s" in dem_key.lower():
+    # Check '3s' first so it does not fall into the generic 'srtm' branch
+    if "3s" in dem_key.lower():
+        tgt_res = 90.0
+    elif "srtm" in dem_key.lower() or "1s" in dem_key.lower():
         tgt_res = 30.0
     elif "10m" in dem_key.lower():
         tgt_res = 10.0
@@ -1106,7 +1110,7 @@ def clip_to_common_extent(dems_to_process, out_dir, reference_key="lidar_0_5m"):
             safe_makedirs(clipped_path.parent)
 
             # Write the clipped raster
-            with rasterio.open(clipped_path, "w", **profile) as dst:
+            with rasterio.open(clipped_path, "w", **profile, BIGTIFF="YES") as dst:
                 # Read in blocks for memory efficiency
                 block_size = src.profile.get("blockxsize", 256)
                 row_start = int(clip_window.row_off)

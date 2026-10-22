@@ -1830,6 +1830,7 @@ def plot_along_scarp_profiles(results, trace_id, output_dir):
     ax.grid(True, alpha=0.3)
     ax.set_title(f"Trace {trace_id} - Along-scarp parameter profiles",
                  fontsize=16)
+    ax.tick_params(labelsize=12)
 
     # Subplot 2: Strike and dip
     ax = axes[1]
@@ -1838,6 +1839,8 @@ def plot_along_scarp_profiles(results, trace_id, output_dir):
     ax2.plot(d, df["dip"], "r-", linewidth=1.0, label="Dip", alpha=0.7)
     ax.set_ylabel("Strike (deg)", fontsize=14)
     ax2.set_ylabel("Dip (deg)", fontsize=14, color="r")
+    ax.tick_params(labelsize=12)
+    ax2.tick_params(labelsize=12)
     ax.legend(fontsize=14, loc="upper left")
     ax2.legend(fontsize=14, loc="upper right")
     ax.grid(True, alpha=0.3)
@@ -1849,6 +1852,7 @@ def plot_along_scarp_profiles(results, trace_id, output_dir):
     ax.plot(d, df["FW_regional_slope_deg"], "b-", linewidth=1.0,
             label="FW slope")
     ax.set_ylabel("Regional slope (deg)", fontsize=14)
+    ax.tick_params(labelsize=12)
     ax.legend(fontsize=14, loc="best")
     ax.grid(True, alpha=0.3)
 
@@ -1858,6 +1862,7 @@ def plot_along_scarp_profiles(results, trace_id, output_dir):
             label="Profile quality")
     ax.set_ylabel("Quality", fontsize=14)
     ax.set_xlabel("Distance along trace (m)", fontsize=14)
+    ax.tick_params(labelsize=12)
     ax.legend(fontsize=14, loc="best")
     ax.grid(True, alpha=0.3)
 
@@ -2572,7 +2577,7 @@ def plot_per_trace_parameter_profiles(file_name, segments, dem_data,
             y_pos = float(np.median(d45_s))
             ax_disp.annotate(
                 f"{trace_id}", xy=(y_s[mid_idx], y_pos),
-                fontsize=8, fontweight="bold", color=_BROWN,
+                fontsize=12, fontweight="bold", color=_BROWN,
                 xytext=(4, 4), textcoords="offset points",
                 bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
                           edgecolor=_BROWN, alpha=0.9, linewidth=0.5),
@@ -2668,7 +2673,7 @@ def plot_per_trace_parameter_profiles(file_name, segments, dem_data,
                 y_pos = float(np.median(sl_valid))
                 ax_slope.annotate(
                     f"{trace_id}", xy=(y_vals[mid_idx], y_pos),
-                    fontsize=8, fontweight="bold", color=_BROWN,
+                    fontsize=12, fontweight="bold", color=_BROWN,
                     xytext=(4, 4), textcoords="offset points",
                     bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
                               edgecolor=_BROWN, alpha=0.9, linewidth=0.5),
@@ -2683,7 +2688,7 @@ def plot_per_trace_parameter_profiles(file_name, segments, dem_data,
     ax_slope.tick_params(labelsize=12)
     handles, labels = ax_slope.get_legend_handles_labels()
     if handles:
-        ax_slope.legend(fontsize=9, loc='best', framealpha=0.9, ncol=2)
+        ax_slope.legend(fontsize=12, loc='best', framealpha=0.9, ncol=2)
 
     # ==================================================================
     # Top-5 highlight: rank by deepest throw + largest slope
@@ -2724,7 +2729,7 @@ def plot_per_trace_parameter_profiles(file_name, segments, dem_data,
         ]
         # Place legend outside the figure (bottom-right)
         fig.legend(handles=legend_lines, loc='lower right',
-                   fontsize=9, framealpha=0.9, ncol=1,
+                   fontsize=12, framealpha=0.9, ncol=1,
                    bbox_to_anchor=(1.0, 0.02),
                    title="Top-5 locations (throw + slope)")
 
@@ -2808,14 +2813,14 @@ def plot_per_trace_parameter_profiles(file_name, segments, dem_data,
                        fontsize=14, fontweight="bold", pad=15)
     ax_rose.set_theta_zero_location("N")
     ax_rose.set_theta_direction(-1)
-    ax_rose.tick_params(labelsize=10)
+    ax_rose.tick_params(labelsize=12)
 
     # Move legend to bottom, outside the polar panel
     handles_rose, labels_rose = ax_rose.get_legend_handles_labels()
     if handles_rose:
         ax_rose.legend(handles_rose, labels_rose,
                        loc='upper center', bbox_to_anchor=(0.5, -0.12),
-                       fontsize=10, framealpha=0.9, ncol=min(4, len(handles_rose)),
+                       fontsize=12, framealpha=0.9, ncol=min(4, len(handles_rose)),
                        title="Traces")
 
     # ==================================================================
@@ -4779,7 +4784,7 @@ def _place_annotation_boxes(ax, ann_texts, ann_positions_3d, grid_z_plot,
         # Annotation box.
         ax.text(
             box_x, box_y, box_z_i, text,
-            fontsize=7,
+            fontsize=14,
             fontweight="bold",
             bbox=dict(
                 facecolor="none",
@@ -4943,8 +4948,8 @@ def plot_trace_overview_3d(file_name, segments, dem_data, transform, dem_shape,
         mappable = plt.cm.ScalarMappable(cmap=plt.cm.terrain)
         mappable.set_array(grid_z[valid_mask])
         cbar = fig.colorbar(mappable, ax=ax, shrink=0.5, aspect=20, pad=0.12)
-        cbar.set_label("Elevation (m)", fontsize=10, labelpad=10)
-        cbar.ax.tick_params(labelsize=8)
+        cbar.set_label("Elevation (m)", fontsize=14, labelpad=10)
+        cbar.ax.tick_params(labelsize=14)
 
         # Plot FSD1 neotectonic feature points and connecting line
         if fsd1_pts is not None and len(fsd1_pts) >= 2:
@@ -5116,19 +5121,19 @@ def plot_trace_overview_3d(file_name, segments, dem_data, transform, dem_shape,
             "N", fontsize=16, fontweight="bold", color="black", zorder=10,
         )
 
-        ax.set_xlabel("Easting (m)", fontsize=12, labelpad=12)
-        ax.set_ylabel("Northing (m)", fontsize=12, labelpad=12)
-        ax.set_zlabel(f"Elevation (m)", fontsize=12, labelpad=12)
+        ax.set_xlabel("Easting (m)", fontsize=14, labelpad=12)
+        ax.set_ylabel("Northing (m)", fontsize=14, labelpad=12)
+        ax.set_zlabel(f"Elevation (m)", fontsize=14, labelpad=12)
         ax.view_init(elev=elev_angle, azim=azim_angle)
         ax.set_title(f"{trace_stub} - {title_suffix}\n"
                      f"(corridor +/-{TRACE_CORRIDOR_BUFFER_M:.0f} m)",
-                     fontsize=13, pad=20)
-        ax.tick_params(labelsize=9)
+                     fontsize=14, pad=20)
+        ax.tick_params(labelsize=14)
 
         # Only show legend for neotectonic feature (no legend for trace points/lines)
         handles, labels = ax.get_legend_handles_labels()
         if handles:
-            ax.legend(fontsize=8, loc="upper left", framealpha=0.9, ncol=1)
+            ax.legend(fontsize=14, loc="upper left", framealpha=0.9, ncol=1)
 
         z_span = np.nanmax(grid_z_plot) - np.nanmin(grid_z_plot)
         ax.set_box_aspect([
@@ -5140,7 +5145,7 @@ def plot_trace_overview_3d(file_name, segments, dem_data, transform, dem_shape,
         # Parameter table at the bottom of the figure
         plt.figtext(
             0.02, 0.02, "\n".join(table_lines),
-            fontsize=7, fontfamily="monospace",
+            fontsize=14, fontfamily="monospace",
             bbox=dict(boxstyle="round,pad=0.5", facecolor="white",
                       alpha=0.85, edgecolor="gray"),
             verticalalignment="bottom", horizontalalignment="left",

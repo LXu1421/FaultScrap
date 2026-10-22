@@ -23,9 +23,9 @@ from rasterio.warp import transform_bounds
 # CONFIGURATION
 # ===================================================================
 
-input_raster = "data/srtm1secdemv1COG_Cli.tif"
+input_raster = "data/3secSRTM_DEM.tif"
 reference_raster = "data/axedale_2020nov01_dem50cm_v10cm_epsg7855.tif"
-output_raster = "data/srtm1s_axe.tif"
+output_raster = "data/srtm3s_axe.tif"
 
 # Buffer in metres to add around the reference extent before clipping.
 # This ensures the clipped area extends slightly beyond the reference,

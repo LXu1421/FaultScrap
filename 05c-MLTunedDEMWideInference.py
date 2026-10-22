@@ -117,12 +117,19 @@ from scarp_05a_hs import (  # noqa: E402,F401
 
 # ── 05c-specific constants ────────────────────────────────────────────
 
+# Map --dem-source keys to the actual GeoTIFF filenames in data/derivatives/
+DEM_SOURCE_MAP = {
+    "lidar_0_5m": "lidar_0_5m_epsg28355_10m_smoke.tif",
+    "srtm1s": "srtm1s_epsg28355_clipped.tif",
+    "srtm3s": "srtm3s_epsg28355.tif",
+}
+
 DEM_SOURCE_KEY = "lidar_0_5m"
-DEM_PATH = OUT_DIR / "lidar_0_5m_epsg28355_10m_smoke.tif"
+DEM_PATH = OUT_DIR / DEM_SOURCE_MAP[DEM_SOURCE_KEY]
 HAND_DIR = OUT_DIR / "visual_audit" / "rem_hand"
 CSV_PATH = OUT_DIR / "known_trace_scarp_validation" / DEM_SOURCE_KEY / "all_inferred_points.csv"
 
-# Output directory: reuse the same known_trace_scarp_validation/lidar_0_5m
+# Output directory: reuse the same known_trace_scarp_validation/<source>
 OUTPUT_DIR = OUT_DIR / "known_trace_scarp_validation" / DEM_SOURCE_KEY
 
 HIGHCON_DIR = DATA_DIR / "HighCon"
@@ -179,6 +186,29 @@ DEFAULT_PARAMS = {
     "MIN_SCARP_WIDTH_M": 30.0,
 }
 
+# Coarse-DEM parameter preset for SRTM 90m data.
+# The 10m-tuned defaults don't transfer directly: at 90m/px, scarp
+# width is measured in pixel steps of 90m (so a 2-pixel scarp = 180m),
+# ray lengths need fewer pixels to cover the same ground distance,
+# and the fallback walk must be long enough to span several pixels.
+COARSE_DEM_PARAMS = {
+    "MIN_SCARP_HEIGHT_M": 0.1,        # SRTM has lower vertical precision
+    "LSM_HYSTERESIS_LOW_SIGMA": 0.25, # more permissive thresholds
+    "LSM_HYSTERESIS_HIGH_SIGMA": 1.0, #  (fewer scales available at 90m)
+    "LSM_PERSISTENCE_K": 1,           # only 1-2 meaningful scales at 90m
+    "TV_WEIGHT_SCALE": 0.5,           # less smoothing needed (already coarse)
+    "BASE_RAY_LENGTH_M": 400.0,       # shorter rays (fewer pixels)
+    "MIN_SCARP_ASYMMETRY_SCORE": 0.15,# lower bar for gentle scarps
+    "MIN_SCARP_WIDTH_M": 10.0,        # effectively ~0.1 pixel
+}
+
+# Resolution threshold above which we use the coarse-DEM branch.
+# 10m lidar -> fine; 30m SRTM 1s -> coarse; 90m SRTM 3s -> coarse.
+COARSE_DEM_THRESHOLD_M = 25.0
+
+# NFD1 structural points path (same inventory as FSD1)
+NFD1_PATH = DATA_DIR / "structural_points_inventory.csv"
+
 
 # ── Smoothed trace line construction ──────────────────────────────────
 
@@ -199,7 +229,13 @@ def _detect_available_traces(highcon_dir=None):
 
 
 def _load_highcon_traces(csv_path=None, trace_indices=None):
-    """Load HighCon trace points, filtered to those present in the lidar CSV.
+    """Load HighCon trace points, filtered to those present in the 05a CSV.
+
+    For coarse-resolution DEMs (e.g. SRTM 90m), the CSV coordinates are
+    pixel centres that differ from the original HighCon survey coordinates
+    by up to half a pixel.  We use a KDTree nearest-neighbour match with
+    a tolerance proportional to the DEM resolution instead of exact key
+    matching, so that coarse DEMs still recover trace points.
 
     Returns a list of dicts: [{trace_id, points: np.array(N,2), n_points, tier_values, break_type_values}, ...]
     """
@@ -210,17 +246,24 @@ def _load_highcon_traces(csv_path=None, trace_indices=None):
 
     if not csv_path.exists():
         print(f"  [Error] 05a output CSV not found: {csv_path}")
-        print(f"  Please run 05a-KnownTraceScarpValidation_hs.py --dem-source lidar_0_5m first.")
+        print(f"  Please run 05a-KnownTraceScarpValidation_hs.py --dem-source {DEM_SOURCE_KEY} first.")
         sys.exit(1)
 
-    # Build coordinate -> (tier, break_type) lookup from the 05a output CSV
+    # Build KDTree from 05a CSV coordinates for nearest-neighbour matching
     csv_df = pd.read_csv(csv_path)
-    bt_map = {}
-    tier_map = {}
-    for _, r in csv_df.iterrows():
-        key = (round(float(r["x"]), 1), round(float(r["y"]), 1))
-        bt_map[key] = r.get("break_type", "p")
-        tier_map[key] = int(r.get("tier", 2)) if pd.notna(r.get("tier", 2)) else 2
+    csv_xy = csv_df[["x", "y"]].to_numpy(dtype=float)
+    csv_tree = cKDTree(csv_xy)
+    csv_bt = csv_df.get("break_type", pd.Series(["p"] * len(csv_df))).values
+    csv_tier = csv_df.get("tier", pd.Series([2] * len(csv_df))).values
+    csv_tier = np.where(pd.notna(csv_tier), csv_tier, 2).astype(int)
+
+    # Determine match tolerance from DEM resolution (default 10m for lidar)
+    try:
+        with rasterio.open(DEM_PATH) as src:
+            dem_res = abs(src.res[0])
+    except Exception:
+        dem_res = 10.0
+    match_tol = dem_res * 1.5  # 1.5x pixel size covers sub-pixel offset
 
     traces = []
     for trace_idx in trace_indices:
@@ -229,16 +272,16 @@ def _load_highcon_traces(csv_path=None, trace_indices=None):
             print(f"  [Warning] {path} not found, skipping Trace{trace_idx}")
             continue
         df = pd.read_excel(path)
-        keys = [(round(float(x), 1), round(float(y), 1)) for x, y in zip(df["x"], df["y"])]
-        in_csv_mask = [k in bt_map for k in keys]
+        trace_xy = df[["x", "y"]].to_numpy(dtype=float)
+        dists, idxs = csv_tree.query(trace_xy, k=1)
+        in_csv_mask = dists <= match_tol
         df = df[in_csv_mask].copy()
         if len(df) == 0:
-            print(f"  Trace{trace_idx}: 0 points in lidar CSV, skipping")
+            print(f"  Trace{trace_idx}: 0 points in CSV (tol={match_tol:.0f}m), skipping")
             continue
-        df["break_type"] = [bt_map[(round(float(x), 1), round(float(y), 1))]
-                             for x, y in zip(df["x"], df["y"])]
-        df["tier"] = [tier_map[(round(float(x), 1), round(float(y), 1))]
-                       for x, y in zip(df["x"], df["y"])]
+        matched_idxs = idxs[in_csv_mask]
+        df["break_type"] = csv_bt[matched_idxs]
+        df["tier"] = csv_tier[matched_idxs]
         points = df[["x", "y"]].to_numpy(dtype=float)
         finite = np.isfinite(points[:, 0]) & np.isfinite(points[:, 1])
         points = points[finite]
@@ -249,7 +292,7 @@ def _load_highcon_traces(csv_path=None, trace_indices=None):
             "tier_values": df["tier"].values[finite],
             "break_type_values": df["break_type"].values[finite],
         })
-        print(f"  Trace{trace_idx}: {len(points)} points in lidar CSV")
+        print(f"  Trace{trace_idx}: {len(points)} points matched (tol={match_tol:.0f}m)")
     return traces
 
 
@@ -743,13 +786,14 @@ def _sample_tuning_windows(dem_src, smoothed_traces, n_windows=TUNING_SAMPLE_WIN
     return windows
 
 
-def _get_hand_masks(dem_crs):
-    """Return the list of HAND/river mask paths for the lidar_0_5m DEM."""
+def _get_hand_masks(dem_crs, dem_source_key=None):
+    """Return the list of HAND/river mask paths for the given DEM source."""
+    key = dem_source_key or DEM_SOURCE_KEY
     return [
-        HAND_DIR / "lidar_0_5m_hand.tif",
-        HAND_DIR / "lidar_0_5m_river_bed.tif",
-        HAND_DIR / "lidar_0_5m_river_surface.tif",
-        HAND_DIR / "lidar_0_5m_river_valley.tif",
+        HAND_DIR / f"{key}_hand.tif",
+        HAND_DIR / f"{key}_river_bed.tif",
+        HAND_DIR / f"{key}_river_surface.tif",
+        HAND_DIR / f"{key}_river_valley.tif",
     ]
 
 def run_criteria_sensitivity_analysis(dem_path, base_params, smoothed_traces,
@@ -1281,11 +1325,116 @@ def _get_fsd1_seed_points(smoothed_traces):
     return None
 
 
+def _load_nfd1_seed_points(dem_bounds=None):
+    """Load NFD1 structural points from the inventory CSV.
+
+    NFD1 points are an alternative fault-survey dataset (distinct from
+    FSD1).  For coarse DEMs where LSM signal is sparse, injecting NFD1
+    points as candidate seeds ensures the classify step evaluates them.
+
+    Parameters
+    ----------
+    dem_bounds : rasterio.coords.BoundingBox or tuple, optional
+        If provided, only points within (left, bottom, right, top) are kept.
+
+    Returns
+    -------
+    np.ndarray (N, 2) or None
+        NFD1 (x, y) coordinates, or None if not found.
+    """
+    if not NFD1_PATH.exists():
+        print("  [NFD1] structural_points_inventory.csv not found")
+        return None
+    df = pd.read_csv(NFD1_PATH)
+    nfd1 = df[df["source"] == "NFD1"]
+    if len(nfd1) == 0:
+        return None
+    xy = nfd1[["XCoord", "YCoord"]].to_numpy(dtype=float)
+    if dem_bounds is not None:
+        left, bottom, right, top = dem_bounds
+        mask = ((xy[:, 0] >= left) & (xy[:, 0] <= right) &
+                (xy[:, 1] >= bottom) & (xy[:, 1] <= top))
+        xy = xy[mask]
+    if len(xy) == 0:
+        return None
+    print(f"  [NFD1] Loaded {len(xy)} NFD1 seed points")
+    return xy
+
+
+def _attribute_point_sources(pixels_df, per_source_masks, transform,
+                             dem_shape):
+    """Tag each inferred point with the candidate source(s) that contributed.
+
+    The classify step in 05a stores the candidate pixel location in the
+    diagnostics.  If diag info (row/col) is available, we use it directly.
+    Otherwise we convert the inferred point's world coordinates back to
+    pixel coordinates and check which per-source masks are True there.
+
+    Parameters
+    ----------
+    pixels_df : pd.DataFrame
+        Must contain 'base_x' and 'base_y' columns (world coordinates).
+        May optionally contain 'row'/'col' columns from diagnostics.
+    per_source_masks : dict {str: np.ndarray(H, W) bool}
+        One boolean mask per candidate source.
+    transform : affine.Affine
+        Rasterio transform for converting world <-> pixel coordinates.
+    dem_shape : tuple (H, W)
+        Shape of the DEM tile.
+
+    Returns
+    -------
+    list of str or None
+        A list of strings like "tpi;tri;dog" (semicolon-separated source
+        names) for each row in pixels_df, or None if attribution fails.
+    """
+    if per_source_masks is None or len(per_source_masks) == 0:
+        return None
+    if len(pixels_df) == 0:
+        return []
+
+    h, w = dem_shape
+    inv_transform = ~transform
+    n = len(pixels_df)
+    source_names = list(per_source_masks.keys())
+
+    # Get pixel coordinates for each inferred point
+    if "row" in pixels_df.columns and "col" in pixels_df.columns:
+        rows = pixels_df["row"].to_numpy(dtype=int)
+        cols = pixels_df["col"].to_numpy(dtype=int)
+    else:
+        # Convert world coords to pixel coords
+        xy = pixels_df[["base_x", "base_y"]].to_numpy(dtype=float)
+        rows = np.zeros(n, dtype=int)
+        cols = np.zeros(n, dtype=int)
+        for i in range(n):
+            c, r = inv_transform * (xy[i, 0], xy[i, 1])
+            cols[i] = int(round(c))
+            rows[i] = int(round(r))
+
+    # Clip to valid range
+    valid_px = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+    tags = ["" for _ in range(n)]
+    for i in range(n):
+        if not valid_px[i]:
+            continue
+        r, c = rows[i], cols[i]
+        matched = []
+        for sname in source_names:
+            mask = per_source_masks[sname]
+            if mask[r, c]:
+                matched.append(sname)
+        tags[i] = ";".join(matched) if matched else "lsm_only"
+
+    return tags
+
+
 def run_dem_wide_inference(dem_path, tuned_params, smoothed_traces,
                            out_dir, write_tiles=False, use_fsd1_seeds=True,
                            bounds=None, seed_accept_radius_m=30.0,
                            alt_sources=None, ml_probability_threshold=0.5,
-                           ml_filter_mode="or"):
+                           ml_filter_mode="or",
+                           use_nfd1_seeds=False, trace_buffer_m=None):
     """Run the 05a LSM + classify pipeline on every tile of the DEM.
 
     This produces a DEM-wide set of inferred scarp points, filtered by
@@ -1294,7 +1443,7 @@ def run_dem_wide_inference(dem_path, tuned_params, smoothed_traces,
     Parameters
     ----------
     dem_path : Path
-        Path to the LiDAR DEM GeoTIFF.
+        Path to the DEM GeoTIFF.
     tuned_params : dict
         Best-found parameters from tune_parameters().
     smoothed_traces : list of dicts
@@ -1317,15 +1466,19 @@ def run_dem_wide_inference(dem_path, tuned_params, smoothed_traces,
         classification.  Keys: 'curvature', 'edge', 'openness', 'aspect'.
         None means no alternative sources.
     ml_probability_threshold : float, optional
-        ML probability threshold for filtering (default 0.5).  Used in both
-        candidate filtering and final pixel filtering stages.
+        ML probability threshold for filtering (default 0.5).
     ml_filter_mode : str, optional
-        How to use ML: 'filter' (AND with other candidates — deprecated,
-        gates out real LSM signal) or 'or' (OR with other candidates, default
-        — ML augments rather than replaces).
+        How to use ML: 'filter' (AND with other candidates) or 'or' (OR with
+        other candidates, default).
+    use_nfd1_seeds : bool, optional
+        If True, inject NFD1 structural points as candidate seeds (useful
+        for coarse DEMs where LSM signal is sparse).
+    trace_buffer_m : float, optional
+        Override the trace proximity filter buffer (default: use global
+        TRACE_BUFFER_M, or scale for coarse DEMs).
     """
     print(f"\n{'='*70}")
-    print(f"[05c] DEM-Wide Inference (0.5m LiDAR)")
+    print("[05c] DEM-Wide Inference")
     print(f"{'='*70}")
 
     _apply_params(_05a, tuned_params)
@@ -1335,7 +1488,31 @@ def run_dem_wide_inference(dem_path, tuned_params, smoothed_traces,
     safe_makedirs(out_dir)
     tile_lsm_dir = safe_makedirs(out_dir / "tile_lsm") if write_tiles else None
 
+    # Detect DEM resolution to decide whether to use the coarse-DEM branch
+    with rasterio.open(dem_path) as _src_probe:
+        dem_resolution = abs(_src_probe.res[0])
+        dem_bounds_probe = _src_probe.bounds
+    is_coarse = dem_resolution > COARSE_DEM_THRESHOLD_M
+    if is_coarse:
+        print(f"  [Coarse DEM branch] resolution={dem_resolution:.1f}m > {COARSE_DEM_THRESHOLD_M}m threshold")
+        print(f"  [Coarse DEM branch] Disabling river mask, scaling width max, using NFD1 seeds")
+
+    # Override the global SCARP_WIDTH_DISCRETE_MAX_M for coarse DEMs.
+    # At 90m/px, the default 200m max means 2 pixels = 180m, so even a
+    # 2-pixel-wide scarp fails the width filter.  Scale to 6 * resolution
+    # (e.g. 540m for 90m SRTM) to allow multi-pixel scarps through.
+    if is_coarse:
+        _original_width_max = getattr(_05a, 'SCARP_WIDTH_DISCRETE_MAX_M', 200)
+        _05a.SCARP_WIDTH_DISCRETE_MAX_M = max(200, int(dem_resolution * 6))
+        print(f"  [Coarse DEM branch] SCARP_WIDTH_DISCRETE_MAX_M: {_original_width_max} -> {_05a.SCARP_WIDTH_DISCRETE_MAX_M}")
+
     hand_masks = _get_hand_masks(None)
+
+    # For coarse DEMs, ignore the river mask entirely (HAND is NaN, and
+    # river_valley mask covers ~32% of the DEM, over-masking candidates).
+    if is_coarse:
+        hand_masks = None
+        print(f"  [Coarse DEM branch] River mask disabled (HAND=NaN, river_valley over-masks)")
 
     # Extract FSD1 seed points for injection into LSM candidate mask
     seed_xy = None
@@ -1345,6 +1522,34 @@ def run_dem_wide_inference(dem_path, tuned_params, smoothed_traces,
             print(f"  Using {len(seed_xy)} FSD1 points as LSM seed candidates")
         else:
             print("  No FSD1 points found for seeding")
+
+    # Extract NFD1 seed points for coarse DEMs
+    nfd1_xy = None
+    if use_nfd1_seeds:
+        nfd1_xy = _load_nfd1_seed_points(dem_bounds=dem_bounds_probe)
+        if nfd1_xy is not None:
+            print(f"  Using {len(nfd1_xy)} NFD1 points as coarse-DEM seed candidates")
+        else:
+            print("  No NFD1 points found for seeding")
+
+    # Combine FSD1 and NFD1 seed points
+    all_seed_xy = None
+    if seed_xy is not None and nfd1_xy is not None:
+        all_seed_xy = np.vstack([seed_xy, nfd1_xy])
+        print(f"  Total seed points (FSD1+NFD1): {len(all_seed_xy)}")
+    elif seed_xy is not None:
+        all_seed_xy = seed_xy
+    elif nfd1_xy is not None:
+        all_seed_xy = nfd1_xy
+
+    # Determine trace proximity buffer: scale for coarse DEMs
+    effective_trace_buffer = trace_buffer_m
+    if effective_trace_buffer is None:
+        if is_coarse:
+            effective_trace_buffer = max(TRACE_BUFFER_M, dem_resolution * 3)
+            print(f"  [Coarse DEM branch] Trace buffer scaled: {TRACE_BUFFER_M}m -> {effective_trace_buffer}m")
+        else:
+            effective_trace_buffer = TRACE_BUFFER_M
 
     all_inferred_rows = []
     all_diag_rows = []          # A1: per-candidate diagnostics across all tiles
@@ -1404,7 +1609,11 @@ def run_dem_wide_inference(dem_path, tuned_params, smoothed_traces,
                 continue
 
             transform = src.window_transform(window)
-            river = _read_mask_on_window(hand_masks, transform, dem_crs, dem.shape)
+            if hand_masks is not None:
+                river = _read_mask_on_window(hand_masks, transform, dem_crs, dem.shape)
+            else:
+                # Coarse DEM: create an all-False river mask (no river filtering)
+                river = np.zeros(dem.shape, dtype=bool)
 
             dem_nan = np.where(valid, dem, np.nan)
             state, lsm_diag = _05a._local_lsm(dem_nan, valid, river, resolution)
@@ -1416,29 +1625,29 @@ def run_dem_wide_inference(dem_path, tuned_params, smoothed_traces,
                 })
                 continue
 
-            # Inject FSD1 seed points into the LSM candidate mask so the
+            # Inject FSD1+NFD1 seed points into the LSM candidate mask so the
             # classify step evaluates them even where LSM hysteresis did
             # not produce a candidate.
-            if seed_xy is not None:
+            if all_seed_xy is not None:
                 tile_bounds = window_bounds(window, transform)
-                in_tile = ((seed_xy[:, 0] >= tile_bounds[0]) &
-                           (seed_xy[:, 0] <= tile_bounds[2]) &
-                           (seed_xy[:, 1] >= tile_bounds[1]) &
-                           (seed_xy[:, 1] <= tile_bounds[3]))
+                in_tile = ((all_seed_xy[:, 0] >= tile_bounds[0]) &
+                           (all_seed_xy[:, 0] <= tile_bounds[2]) &
+                           (all_seed_xy[:, 1] >= tile_bounds[1]) &
+                           (all_seed_xy[:, 1] <= tile_bounds[3]))
                 if np.any(in_tile):
                     state = _add_seed_candidates_to_state(
-                        state, seed_xy[in_tile], transform, dem.shape,
+                        state, all_seed_xy[in_tile], transform, dem.shape,
                         buffer_px=max(1, int(np.ceil(seed_accept_radius_m / resolution))))
 
                 cand_rows, cand_cols = np.where(state["candidates"])
-                if len(cand_rows) and len(seed_xy) > 0:
+                if len(cand_rows) and len(all_seed_xy) > 0:
                     cand_x, cand_y = transform * (cand_cols, cand_rows)
                     cand_xy = np.c_[cand_x, cand_y]
-                    seed_tree = cKDTree(seed_xy)
+                    seed_tree = cKDTree(all_seed_xy)
                     dists, _ = seed_tree.query(cand_xy, k=1)
                     accepted_mask = dists <= seed_accept_radius_m
                     n_accepted = int(accepted_mask.sum())
-                    print(f"  [Tile {tile_idx + 1}] Seed insertion: {len(seed_xy)} seeds, "
+                    print(f"  [Tile {tile_idx + 1}] Seed insertion: {len(all_seed_xy)} seeds, "
                           f"{n_accepted} candidates within {seed_accept_radius_m}m")
                     if n_accepted > 0:
                         seed_accepted_xy_tile.append(cand_xy[accepted_mask])
@@ -1449,10 +1658,13 @@ def run_dem_wide_inference(dem_path, tuned_params, smoothed_traces,
             # If ml_filter_mode='filter': Use ML probability to FILTER candidates
             # (AND operation) — only keep candidates with high ML probability.
             # If ml_filter_mode='or': OR alternative sources into candidates.
+            # Track per-source masks for source attribution of inferred points.
+            tile_per_source = None
             if alt_sources is not None:
                 n_before = int(state["candidates"].sum())
-                alt_mask = _compute_alternative_candidates(
-                    dem, valid, resolution, transform, sources=alt_sources)
+                alt_mask, tile_per_source = _compute_alternative_candidates(
+                    dem, valid, resolution, transform, sources=alt_sources,
+                    return_per_source=True)
                 
                 # Use ML as a primary filter if ml_filter_mode='filter'
                 if ml_filter_mode == "filter" and alt_sources.get("ml_probability", False):
@@ -1577,6 +1789,24 @@ def run_dem_wide_inference(dem_path, tuned_params, smoothed_traces,
                 if "classify_method" in pixels.columns:
                     keep_cols.append("classify_method")
                 
+                # ── Source attribution: tag each inferred point with which
+                # alternative candidate source(s) contributed to the pixel
+                # it was classified from.  This enables per-method breakdown
+                # in _evaluate_inference_quality.
+                if tile_per_source is not None and len(pixels) > 0:
+                    # The classify step stores the candidate pixel (row, col)
+                    # in the state.  We need to map each inferred point back
+                    # to its source pixel.  The pixels DataFrame has base_x/
+                    # base_y (world coords of the base), but the candidate
+                    # pixel is the original (row, col) from state["candidates"].
+                    # We use the diag_df if available (it has row/col), or
+                    # fall back to converting world coords back to pixel coords.
+                    source_tags = _attribute_point_sources(
+                        pixels, tile_per_source, transform, dem.shape)
+                    if source_tags is not None:
+                        pixels["candidate_sources"] = source_tags
+                        keep_cols.append("candidate_sources")
+                
                 all_inferred_rows.append(pixels[keep_cols].copy())
 
 
@@ -1617,15 +1847,33 @@ def run_dem_wide_inference(dem_path, tuned_params, smoothed_traces,
           f"{out_dir / 'dem_wide_inferred_points.csv'}")
 
     # Filter by proximity to smoothed traces (per-trace buffer)
+    # For coarse DEMs with NFD1 seeds, also keep points near NFD1 points
+    # that were NOT caught by the trace proximity filter — this is a union,
+    # not a replacement.
     if len(inferred_df) > 0 and smoothed_traces:
         xy = inferred_df[["x", "y"]].to_numpy(dtype=float)
         proximity_mask, nearest_dist = _filter_by_trace_proximity(
-            xy, smoothed_traces, buffer_m=TRACE_BUFFER_M)
+            xy, smoothed_traces, buffer_m=effective_trace_buffer)
+
+        # For coarse DEMs with NFD1, union with NFD1 proximity
+        if nfd1_xy is not None and len(nfd1_xy) > 0:
+            nfd1_tree_prox = cKDTree(nfd1_xy)
+            nfd1_dists_prox, _ = nfd1_tree_prox.query(xy, k=1)
+            nfd1_buffer = dem_resolution * 5  # 5x DEM resolution for broader recovery
+            nfd1_mask = nfd1_dists_prox <= nfd1_buffer
+            # Union: keep points near traces OR near NFD1
+            n_before_union = int(proximity_mask.sum())
+            proximity_mask = proximity_mask | nfd1_mask
+            n_union = int(proximity_mask.sum())
+            n_nfd1_added = n_union - n_before_union
+            print(f"  [NFD1 union] Trace+NFD1 proximity: {n_union}/{len(inferred_df)} "
+                  f"(NFD1 added {n_nfd1_added}, buffer={nfd1_buffer:.0f}m)")
+
         n_before = len(inferred_df)
         inferred_df = inferred_df[proximity_mask].copy()
         inferred_df["nearest_trace_dist_m"] = nearest_dist[proximity_mask]
         buffer_desc = "/".join(
-            f"T{t['trace_id']}={t.get('buffer_m', TRACE_BUFFER_M):.0f}m"
+            f"T{t['trace_id']}={t.get('buffer_m', effective_trace_buffer):.0f}m"
             for t in smoothed_traces)
         print(f"  Trace proximity filter ({buffer_desc}): {n_before:,} -> {len(inferred_df):,}")
 
@@ -1670,7 +1918,8 @@ def run_dem_wide_inference(dem_path, tuned_params, smoothed_traces,
 
 # ── Quality evaluation ────────────────────────────────────────────────
 
-def _evaluate_inference_quality(inferred_df, smoothed_traces, match_radius=100.0):
+def _evaluate_inference_quality(inferred_df, smoothed_traces, match_radius=100.0,
+                                alt_sources=None, tuned_params=None):
     """Evaluate how well the inferred points cover the ground truth.
 
     For Trace 2 (when FSD1 replacement is active), evaluation is done
@@ -1682,16 +1931,198 @@ def _evaluate_inference_quality(inferred_df, smoothed_traces, match_radius=100.0
 
     For Trace 1, ``raw_points`` and ``raw_points_highcon`` are identical.
 
-    Returns dict with recall, precision, f1, coverage stats, and per-point
-    recovered masks so the plot can distinguish recovered vs missed points.
+    Returns dict with recall, precision, f1, coverage stats, per-point
+    recovered masks so the plot can distinguish recovered vs missed points,
+    and **method_breakdown** — a per-method report of how many and what
+    percentage of inferred points each detector contributed.
     """
+
+    # ── Method breakdown ──────────────────────────────────────────
+    # Report the number and % of inferred points attributed to each of
+    # the 19 methods listed in the project description.  These fall into
+    # two categories:
+    #
+    # (A) Per-point source attribution (from candidate_sources column):
+    #     These are detectors that directly contribute candidate pixels.
+    #     Each inferred point is tagged with the source(s) whose mask
+    #     was True at the candidate pixel location.
+    #
+    # (B) Pipeline-level methods (enabled/disabled, not per-point):
+    #     These methods operate at the pipeline level (e.g. smoothing,
+    #     clustering, optimisation) and cannot be attributed to individual
+    #     points.  We report whether they were enabled and describe their
+    #     role.
+
+    # Mapping from internal source keys to user-facing method names.
+    # Each internal key maps to exactly one display name — no grouping.
+    SOURCE_NAME_MAP = {
+        "curvature": "Laplacian curvature",
+        "edge": "Edge detection",
+        "openness": "Openness",
+        "aspect": "Aspect analysis",
+        "adaptive_slope": "Adaptive slope",
+        "tpi": "TPI",
+        "tri": "TRI",
+        "dog": "Difference of Gaussians",
+        "geomorphon": "Geomorphons",
+        "hough": "Hough transforms",
+        "orientation": "Orientation-consistent gradients",
+        "phase_congruency": "Phase congruency",
+        "ridge_crest": "Ridge detection",
+        "ml_probability": "Random Forests",
+        "subtle_slope_break": "Subtle slope break",
+        "convexity_profile": "Convexity profile",
+        "gentle_slope_anomaly": "Gentle slope anomaly",
+        "multiscale_relief": "Multiscale relief",
+        "slope_profile_curvature": "Slope-profile curvature",
+    }
+
+    # Pipeline-level methods (always report as enabled/disabled)
+    PIPELINE_METHODS = [
+        {"key": "tv_regularisation", "name": "TV regularisation",
+         "enabled": True,
+         "description": "DEM pre-smoothing before feature detection"},
+        {"key": "hysteresis", "name": "Hysteresis thresholds",
+         "enabled": True,
+         "description": "LSM persistent pixel detection via high/low thresholds"},
+        {"key": "b_splines", "name": "B-splines",
+         "enabled": True,
+         "description": "Smoothing B-spline fitting for trace line regularisation"},
+        {"key": "bayesian_optimisation", "name": "Bayesian optimisation",
+         "enabled": True,
+         "description": "Parameter tuning via Optuna TPE sampler"},
+        {"key": "dbscan", "name": "DBSCAN",
+         "enabled": True,
+         "description": "Clustering of nearby candidate points"},
+        {"key": "theil_sen", "name": "Theil-Sen regression",
+         "enabled": False,
+         "description": "Robust regression for scarp parameter profiling (06b)"},
+        {"key": "diffusion", "name": "Diffusion modelling",
+         "enabled": False,
+         "description": "1-D diffusion equation for scarp degradation (06b)"},
+    ]
+
+    n_inferred_total = len(inferred_df) if inferred_df is not None else 0
+
+    method_breakdown = {
+        "n_inferred_total": n_inferred_total,
+        "per_point_methods": {},
+        "co_occurrence_matrix": {},
+        "pipeline_methods": {},
+    }
+
+    # (A) Per-point source attribution with co-occurrence matrix
+    if inferred_df is not None and n_inferred_total > 0 and \
+       "candidate_sources" in inferred_df.columns:
+
+        cs_col = inferred_df["candidate_sources"].fillna("lsm_only")
+
+        # Parse each point's source set into display names
+        all_method_names = sorted(set(SOURCE_NAME_MAP.values()))
+        # Add ray tracing & classify fallback if classify_method exists
+        has_classify = "classify_method" in inferred_df.columns
+        if has_classify:
+            all_method_names = sorted(all_method_names +
+                ["Ray tracing", "Curvature fallback (classify)"])
+        # "LSM (base)" covers points where no alt source matched — the
+        # point came from the base LSM hysteresis detector only.
+        all_method_names = sorted(all_method_names + ["LSM (base)"])
+
+        method_idx = {m: i for i, m in enumerate(all_method_names)}
+        n_methods = len(all_method_names)
+        # Co-occurrence counts: cooc[i, j] = number of points where both
+        # method i and method j contributed (diagonal = solo count)
+        cooc = np.zeros((n_methods, n_methods), dtype=int)
+        method_point_counts = {m: 0 for m in all_method_names}
+
+        # If classify_method exists, tag each point with ray_traced or
+        # curvature_fallback in addition to its candidate_sources
+        if has_classify:
+            cm = inferred_df["classify_method"].fillna("none").to_numpy()
+
+        for pidx, val in enumerate(cs_col):
+            if not val or (isinstance(val, float) and np.isnan(val)):
+                val = "lsm_only"
+            sources = str(val).split(";")
+            seen_methods = set()
+            for src in sources:
+                src = src.strip()
+                if not src:
+                    continue
+                if src == "lsm_only":
+                    # No alt source matched — base LSM only
+                    seen_methods.add("LSM (base)")
+                    continue
+                method_name = SOURCE_NAME_MAP.get(src, src)
+                seen_methods.add(method_name)
+            # Add classify_method tag
+            if has_classify:
+                cm_val = cm[pidx] if pidx < len(cm) else "none"
+                if cm_val == "ray_traced":
+                    seen_methods.add("Ray tracing")
+                elif cm_val == "curvature_fallback":
+                    seen_methods.add("Curvature fallback (classify)")
+
+            seen_list = sorted(seen_methods)
+            # Solo counts
+            for m in seen_list:
+                method_point_counts[m] += 1
+            # Co-occurrence: for every ordered pair in the set
+            for i_m in seen_list:
+                for j_m in seen_list:
+                    cooc[method_idx[i_m], method_idx[j_m]] += 1
+
+        # Build per-method solo report
+        for mname in all_method_names:
+            count = method_point_counts.get(mname, 0)
+            pct = (count / n_inferred_total * 100.0) if n_inferred_total > 0 else 0.0
+            method_breakdown["per_point_methods"][mname] = {
+                "n_points": count,
+                "percentage": round(pct, 2),
+            }
+
+        # Build co-occurrence matrix as nested dict
+        cooc_dict = {}
+        for i, mi in enumerate(all_method_names):
+            cooc_dict[mi] = {}
+            for j, mj in enumerate(all_method_names):
+                cooc_dict[mi][mj] = int(cooc[i, j])
+        method_breakdown["co_occurrence_matrix"] = {
+            "method_names": all_method_names,
+            "matrix": cooc_dict,
+            "n_total_points": n_inferred_total,
+        }
+    else:
+        # No candidate_sources column — report ray tracing from classify_method
+        if inferred_df is not None and n_inferred_total > 0 and \
+           "classify_method" in inferred_df.columns:
+            cm = inferred_df["classify_method"].fillna("none")
+            ray_traced = int((cm == "ray_traced").sum())
+            curvature_fallback = int((cm == "curvature_fallback").sum())
+            method_breakdown["per_point_methods"]["Ray tracing"] = {
+                "n_points": ray_traced,
+                "percentage": round(ray_traced / n_inferred_total * 100.0, 2),
+            }
+            method_breakdown["per_point_methods"]["Curvature fallback (classify)"] = {
+                "n_points": curvature_fallback,
+                "percentage": round(curvature_fallback / n_inferred_total * 100.0, 2),
+            }
+
+    # (B) Pipeline-level methods
+    for pm in PIPELINE_METHODS:
+        method_breakdown["pipeline_methods"][pm["name"]] = {
+            "enabled": pm["enabled"],
+            "description": pm["description"],
+        }
+
     if len(inferred_df) == 0:
         return {"recall": 0.0, "precision": 0.0, "f1": 0.0,
                 "n_inferred": 0, "n_highcon_total": 0, "n_highcon_recovered": 0,
                 "per_trace": {},
                 "highcon_recovered_mask": np.array([], dtype=bool),
                 "highcon_xy": np.empty((0, 2)),
-                "inferred_recovered_mask": np.array([], dtype=bool)}
+                "inferred_recovered_mask": np.array([], dtype=bool),
+                "method_breakdown": method_breakdown}
 
     # Use raw_points_highcon if available (preserves original HighCon even
     # when Trace2 was replaced by FSD1 for smoothing). This is the fair
@@ -1713,7 +2144,8 @@ def _evaluate_inference_quality(inferred_df, smoothed_traces, match_radius=100.0
                 "per_trace": {},
                 "highcon_recovered_mask": np.array([], dtype=bool),
                 "highcon_xy": np.empty((0, 2)),
-                "inferred_recovered_mask": np.array([], dtype=bool)}
+                "inferred_recovered_mask": np.array([], dtype=bool),
+                "method_breakdown": method_breakdown}
 
     inferred_xy = inferred_df[["x", "y"]].to_numpy(dtype=float)
 
@@ -1757,6 +2189,34 @@ def _evaluate_inference_quality(inferred_df, smoothed_traces, match_radius=100.0
 
         per_trace[trace["trace_id"]] = trace_info
 
+    # ── NFD1 recovery evaluation (for coarse DEMs) ────────────────
+    # Use a resolution-scaled match radius for NFD1: at 90m/px, a 100m match
+    # radius barely covers 1 pixel.  Scale to max(match_radius, resolution * 2).
+    nfd1_match_radius = match_radius
+    try:
+        with rasterio.open(DEM_PATH) as _src_nfd1:
+            _nfd1_res = abs(_src_nfd1.res[0])
+        nfd1_match_radius = max(match_radius, _nfd1_res * 2)
+    except Exception:
+        pass
+
+    nfd1_stats = {}
+    if NFD1_PATH.exists():
+        nfd1_df = pd.read_csv(NFD1_PATH)
+        nfd1_all = nfd1_df[nfd1_df["source"] == "NFD1"]
+        if len(nfd1_all) > 0 and len(inferred_xy) > 0:
+            nfd1_xy = nfd1_all[["XCoord", "YCoord"]].to_numpy(dtype=float)
+            nfd1_dists, _ = inferred_tree.query(nfd1_xy, k=1)
+            nfd1_recovered = int(np.sum(nfd1_dists <= nfd1_match_radius))
+            nfd1_stats = {
+                "n_nfd1_total": len(nfd1_xy),
+                "n_nfd1_recovered": nfd1_recovered,
+                "nfd1_recall": nfd1_recovered / len(nfd1_xy),
+                "match_radius_m": nfd1_match_radius,
+            }
+            print(f"  [NFD1] Recovery: {nfd1_recovered}/{len(nfd1_xy)} "
+                  f"({nfd1_stats['nfd1_recall']:.4f})")
+
     return {
         "recall": recall,
         "precision": precision,
@@ -1769,7 +2229,397 @@ def _evaluate_inference_quality(inferred_df, smoothed_traces, match_radius=100.0
         "highcon_recovered_mask": highcon_recovered_mask,
         "highcon_xy": all_highcon,
         "inferred_recovered_mask": inferred_recovered_mask,
+        # Per-method breakdown of inferred points by detector source
+        "method_breakdown": method_breakdown,
+        # NFD1 recovery (populated for coarse DEMs)
+        "nfd1": nfd1_stats,
     }
+
+
+def _plot_method_breakdown(quality, output_path):
+    """Generate a three-panel method breakdown figure plus CSV tables.
+
+    Produces:
+    1. ``method_breakdown.png`` — three-panel figure:
+       (top) horizontal bar chart of solo counts, grouped by method
+       category (LSM base / Additional detectors / Subtle-scarp detectors)
+       with light-blue background bands and group separators;
+       (middle) lower-triangular co-occurrence heatmap (same group order);
+       (bottom) two-part panel:
+         * left: greedy set-cover showing minimal method set to
+           recover all inferred points;
+         * right: pairwise complementary analysis — best method
+           pairs ranked by coverage with minimal cross-method overlap.
+    2. ``method_breakdown_summary.csv`` — flat table (solo counts).
+    3. ``method_breakdown_matrix.csv`` — full co-occurrence matrix.
+    4. ``method_breakdown_setcover.csv`` — greedy set-cover steps.
+    5. ``method_breakdown_pairs.csv`` — pairwise complementary ranking.
+
+    Ray tracing and curvature fallback (classify) are excluded from
+    the visual panels (they are classification paths, not detectors).
+    """
+    mb = quality.get("method_breakdown", {})
+    n_total = mb.get("n_inferred_total", 0)
+
+    # ── Methods to exclude from visual panels ────────────────────
+    EXCLUDE = {"Ray tracing", "Curvature fallback (classify)"}
+
+    # ── Method grouping and ordering ──────────────────────────────
+    SUBTLE_SCARP = {
+        "Subtle slope break", "Convexity profile",
+        "Gentle slope anomaly", "Multiscale relief",
+        "Slope-profile curvature",
+    }
+
+    # ── Flat summary CSV (solo counts + pipeline) ─────────────────
+    rows = []
+    for name, info in mb.get("per_point_methods", {}).items():
+        rows.append({
+            "method": name,
+            "n_points": info["n_points"],
+            "percentage": info["percentage"],
+            "type": "per-point",
+            "enabled": "",
+            "description": "",
+        })
+    for name, info in mb.get("pipeline_methods", {}).items():
+        rows.append({
+            "method": name,
+            "n_points": "N/A",
+            "percentage": "N/A",
+            "type": "pipeline",
+            "enabled": info["enabled"],
+            "description": info["description"],
+        })
+
+    csv_path = output_path.with_name(output_path.stem + "_summary.csv")
+    import csv as _csv
+    with open(csv_path, "w", newline="") as f:
+        writer = _csv.writer(f)
+        writer.writerow(["method", "n_points", "percentage", "type",
+                         "enabled", "description"])
+        for r in rows:
+            writer.writerow([
+                r["method"], r["n_points"], r["percentage"], r["type"],
+                r.get("enabled", ""), r.get("description", ""),
+            ])
+    print(f"  Saved method breakdown summary CSV to {csv_path}")
+
+    # ── Co-occurrence matrix CSV (full, including excluded) ───────
+    cooc_data = mb.get("co_occurrence_matrix", {})
+    all_method_names = cooc_data.get("method_names", [])
+    cooc_dict = cooc_data.get("matrix", {})
+
+    matrix_csv_path = output_path.with_name(output_path.stem + "_matrix.csv")
+    with open(matrix_csv_path, "w", newline="") as f:
+        writer = _csv.writer(f)
+        writer.writerow([""] + all_method_names)
+        for mi in all_method_names:
+            row_vals = [cooc_dict.get(mi, {}).get(mj, 0) for mj in all_method_names]
+            writer.writerow([mi] + row_vals)
+    print(f"  Saved co-occurrence matrix CSV to {matrix_csv_path}")
+
+    # ── Filter methods for visual panels ──────────────────────────
+    pp_methods = mb.get("per_point_methods", {})
+    viz_methods = {k: v for k, v in pp_methods.items() if k not in EXCLUDE}
+    if not viz_methods:
+        print("  [Method breakdown] No per-point methods to plot, skipping chart.")
+        return
+
+    # Build grouped + sorted method list:
+    # Group 1: LSM (base) — always first
+    # Group 2: Additional detectors (everything except LSM and subtle-scarp)
+    # Group 3: Subtle-scarp detectors — always last
+    lsm_items = [(k, v) for k, v in viz_methods.items() if k == "LSM (base)"]
+    subtle_items = [(k, v) for k, v in viz_methods.items() if k in SUBTLE_SCARP]
+    additional_items = [(k, v) for k, v in viz_methods.items()
+                        if k != "LSM (base)" and k not in SUBTLE_SCARP]
+
+    lsm_items.sort(key=lambda x: x[1]["n_points"], reverse=True)
+    additional_items.sort(key=lambda x: x[1]["n_points"], reverse=True)
+    subtle_items.sort(key=lambda x: x[1]["n_points"], reverse=True)
+
+    grouped = lsm_items + additional_items + subtle_items
+    names = [m[0] for m in grouped]
+    counts = [m[1]["n_points"] for m in grouped]
+    pcts = [m[1]["percentage"] for m in grouped]
+    n_methods = len(names)
+
+    # Group labels for background colours
+    group_labels = []
+    for m in names:
+        if m == "LSM (base)":
+            group_labels.append("LSM (base)")
+        elif m in SUBTLE_SCARP:
+            group_labels.append("Subtle-scarp detectors")
+        else:
+            group_labels.append("Additional detectors")
+
+    # Build co-occurrence matrix array (filtered order)
+    cooc_arr = np.zeros((n_methods, n_methods), dtype=int)
+    name_to_idx = {n: i for i, n in enumerate(names)}
+    for mi in names:
+        for mj in names:
+            cooc_arr[name_to_idx[mi], name_to_idx[mj]] = \
+                cooc_dict.get(mi, {}).get(mj, 0)
+
+    cooc_pct = cooc_arr / n_total * 100.0 if n_total > 0 else cooc_arr
+
+    # ── Greedy set-cover (approximate, capped at n_total) ─────────
+    solo_counts = np.array([counts[i] for i in range(n_methods)])
+    remaining = set(range(n_methods))
+    selected_order = []
+    union_estimate = 0
+    covered_per_step = []
+
+    for step in range(n_methods):
+        best_gain = -1
+        best_idx = -1
+        for i in remaining:
+            overlap = 0
+            for j in selected_order:
+                overlap = max(overlap, cooc_arr[i, j])
+            gain = max(0, int(solo_counts[i]) - overlap)
+            if gain > best_gain:
+                best_gain = gain
+                best_idx = i
+        if best_idx == -1 or best_gain == 0:
+            break
+        selected_order.append(best_idx)
+        remaining.remove(best_idx)
+        union_estimate = min(union_estimate + best_gain, n_total)
+        covered_per_step.append({
+            "step": step + 1,
+            "method": names[best_idx],
+            "incremental": best_gain,
+            "cumulative": union_estimate,
+            "cumulative_pct": union_estimate / n_total * 100.0 if n_total > 0 else 0,
+        })
+
+    # Set-cover CSV
+    setcover_csv = output_path.with_name(output_path.stem + "_setcover.csv")
+    with open(setcover_csv, "w", newline="") as f:
+        writer = _csv.writer(f)
+        writer.writerow(["step", "method", "incremental_points",
+                         "cumulative_points", "cumulative_pct"])
+        for s in covered_per_step:
+            writer.writerow([s["step"], s["method"], s["incremental"],
+                             s["cumulative"], round(s["cumulative_pct"], 2)])
+    print(f"  Saved set-cover CSV to {setcover_csv}")
+
+    # ── Pairwise complementary analysis ──────────────────────────
+    # For every method pair (i, j) compute:
+    #   union_size   = |A_i| + |A_j| - |A_i ∩ A_j|
+    #   overlap_pct  = |A_i ∩ A_j| / union_size
+    #   jaccard      = |A_i ∩ A_j| / union_size  (same as overlap_pct)
+    # Rank by union_size descending, then overlap_pct ascending.
+    pair_results = []
+    for i in range(n_methods):
+        for j in range(i + 1, n_methods):
+            si = int(solo_counts[i])
+            sj = int(solo_counts[j])
+            inter = int(cooc_arr[i, j])
+            union = si + sj - inter
+            if union == 0:
+                continue
+            overlap_pct = inter / union * 100.0
+            jaccard = inter / union
+            coverage_pct = union / n_total * 100.0 if n_total > 0 else 0
+            pair_results.append({
+                "method_a": names[i],
+                "method_b": names[j],
+                "count_a": si,
+                "count_b": sj,
+                "intersection": inter,
+                "union": union,
+                "coverage_pct": coverage_pct,
+                "overlap_pct": overlap_pct,
+                "jaccard": jaccard,
+            })
+    # Sort: highest coverage first, then lowest overlap
+    pair_results.sort(key=lambda x: (-x["coverage_pct"], x["overlap_pct"]))
+
+    # Pairs CSV
+    pairs_csv = output_path.with_name(output_path.stem + "_pairs.csv")
+    with open(pairs_csv, "w", newline="") as f:
+        writer = _csv.writer(f)
+        writer.writerow(["rank", "method_a", "method_b", "count_a",
+                         "count_b", "intersection", "union",
+                         "coverage_pct", "overlap_pct", "jaccard"])
+        for rank, p in enumerate(pair_results, 1):
+            writer.writerow([rank, p["method_a"], p["method_b"],
+                             p["count_a"], p["count_b"], p["intersection"],
+                             p["union"], round(p["coverage_pct"], 2),
+                             round(p["overlap_pct"], 2),
+                             round(p["jaccard"], 4)])
+    print(f"  Saved pairwise complementary CSV to {pairs_csv}")
+
+    # ── Three-panel figure ────────────────────────────────────────
+    # Light-blue background shades per group (all blue tones)
+    group_bg_colors = {
+        "LSM (base)": "#D6E4FF",           # medium light blue
+        "Additional detectors": "#E8F0FE",  # lighter blue
+        "Subtle-scarp detectors": "#EDF3FC", # very light blue
+    }
+    bar_colors_map = {
+        "LSM (base)": "#4A90D9",
+        "Additional detectors": "#5B9BD5",
+        "Subtle-scarp detectors": "#7BAFD4",
+    }
+
+    fig, (ax_bar, ax_hm, ax_sc) = plt.subplots(
+        3, 1, figsize=(max(10, n_methods * 0.7),
+                        max(5, n_methods * 0.3) + 6 + 7),
+        gridspec_kw={"height_ratios": [1.0, 1.2, 1.1]})
+
+    # ── Top panel: horizontal bar chart with group backgrounds ────
+    y_pos = np.arange(n_methods)
+    bar_colors = [bar_colors_map[gl] for gl in group_labels]
+
+    bars = ax_bar.barh(y_pos, counts, color=bar_colors,
+                        edgecolor="navy", alpha=0.85)
+    for bar, cnt, pct in zip(bars, counts, pcts):
+        label = f"{cnt:,} ({pct:.1f}%)" if cnt > 0 else "0 (0.0%)"
+        ax_bar.text(bar.get_width() + max(counts) * 0.01,
+                    bar.get_y() + bar.get_height() / 2,
+                    label, va="center", fontsize=8, color="navy")
+
+    for i in range(n_methods):
+        gl = group_labels[i]
+        ax_bar.axhspan(i - 0.45, i + 0.45,
+                        color=group_bg_colors.get(gl, "#F0F0F0"),
+                        alpha=0.6, zorder=0)
+
+    ax_bar.set_yticks(y_pos)
+    ax_bar.set_yticklabels(names, fontsize=8)
+    ax_bar.invert_yaxis()
+    ax_bar.set_xlabel("Number of inferred points", fontsize=10)
+    ax_bar.set_title(f"Solo contribution per method (n={n_total:,} inferred points)",
+                     fontsize=11, fontweight="bold")
+    ax_bar.set_xlim(0, max(counts) * 1.30 if counts else 1)
+
+    # Group separators
+    prev_group = group_labels[0]
+    for i in range(1, n_methods):
+        if group_labels[i] != prev_group:
+            ax_bar.axhline(y=i - 0.5, color="grey", linewidth=0.8,
+                           linestyle="--", alpha=0.6)
+            prev_group = group_labels[i]
+
+    # ── Middle panel: co-occurrence heatmap (lower triangular) ────
+    mask = np.triu(np.ones_like(cooc_arr, dtype=bool), k=1)
+    display_arr = np.ma.array(cooc_arr, mask=mask)
+
+    im = ax_hm.imshow(display_arr, cmap="YlOrRd", aspect="auto")
+    ax_hm.set_xticks(np.arange(n_methods))
+    ax_hm.set_yticks(np.arange(n_methods))
+    ax_hm.set_xticklabels(names, fontsize=7, rotation=45, ha="right")
+    ax_hm.set_yticklabels(names, fontsize=7)
+    ax_hm.set_title("Method co-occurrence matrix (points where both methods contributed)",
+                    fontsize=11, fontweight="bold")
+
+    for i in range(n_methods):
+        for j in range(i + 1):
+            val = cooc_arr[i, j]
+            if val == 0:
+                continue
+            pct_val = cooc_pct[i, j]
+            text_color = "white" if val > cooc_arr.max() * 0.5 else "black"
+            ax_hm.text(j, i, f"{val:,}\n({pct_val:.1f}%)",
+                       ha="center", va="center", fontsize=6,
+                       color=text_color)
+
+    cbar = fig.colorbar(im, ax=ax_hm, fraction=0.046, pad=0.04)
+    cbar.set_label("Number of points", fontsize=9)
+
+    # ── Bottom panel: set-cover (left) + best pairs (right) ──────
+    # Clear the default axes and create two side-by-side sub-panels
+    ax_sc.clear()
+    ax_sc.set_axis_off()
+
+    # Create inset axes for the two sub-panels
+    fig.add_axes([0.08, 0.02, 0.40, 0.12])   # left: set-cover
+    fig.add_axes([0.55, 0.02, 0.38, 0.12])   # right: best pairs
+    ax_left = fig.axes[-2]
+    ax_right = fig.axes[-1]
+
+    # — Left sub-panel: greedy set-cover —
+    sc_names = [s["method"] for s in covered_per_step]
+    sc_increments = [s["incremental"] for s in covered_per_step]
+    sc_cumulative = [s["cumulative"] for s in covered_per_step]
+    sc_cum_pct = [s["cumulative_pct"] for s in covered_per_step]
+    n_sc = len(sc_names)
+
+    sc_y = np.arange(n_sc)
+    sc_colors = []
+    for s in sc_names:
+        if s == "LSM (base)":
+            sc_colors.append("#4A90D9")
+        elif s in SUBTLE_SCARP:
+            sc_colors.append("#7BAFD4")
+        else:
+            sc_colors.append("#5B9BD5")
+
+    bars_sc = ax_left.barh(sc_y, sc_increments, color=sc_colors,
+                           edgecolor="navy", alpha=0.85)
+    for bar, inc, cum, cpct in zip(bars_sc, sc_increments,
+                                    sc_cumulative, sc_cum_pct):
+        label = f"+{inc:,} (cum: {cum:,} / {cpct:.1f}%)"
+        ax_left.text(bar.get_width() + max(sc_increments) * 0.01,
+                     bar.get_y() + bar.get_height() / 2,
+                     label, va="center", fontsize=7, color="navy")
+
+    ax_left.set_yticks(sc_y)
+    ax_left.set_yticklabels(sc_names, fontsize=7)
+    ax_left.invert_yaxis()
+    ax_left.set_xlabel("Incremental points recovered", fontsize=9)
+    ax_left.set_title("Greedy set-cover: minimal method set",
+                      fontsize=10, fontweight="bold")
+    ax_left.set_xlim(0, max(sc_increments) * 1.7 if sc_increments else 1)
+    ax_left.axvline(x=n_total, color="red", linestyle="--", alpha=0.4,
+                    linewidth=1)
+
+    # — Right sub-panel: best complementary pairs —
+    n_pairs_show = min(12, len(pair_results))
+    pr = pair_results[:n_pairs_show]
+    pr_labels = [f"{p['method_a']}  +  {p['method_b']}" for p in pr]
+    pr_coverage = [p["coverage_pct"] for p in pr]
+    pr_overlap = [p["overlap_pct"] for p in pr]
+
+    pr_y = np.arange(n_pairs_show)
+    # Colour bars by overlap level (low overlap = greener)
+    pr_colors = []
+    for ov in pr_overlap:
+        if ov < 20:
+            pr_colors.append("#2E8B57")    # sea green — very complementary
+        elif ov < 40:
+            pr_colors.append("#6BBF8A")    # light green
+        elif ov < 60:
+            pr_colors.append("#DAA520")    # goldenrod
+        else:
+            pr_colors.append("#CD5C5C")    # indian red — high overlap
+
+    bars_pr = ax_right.barh(pr_y, pr_coverage, color=pr_colors,
+                             edgecolor="grey", alpha=0.85)
+    for bar, cov, ov in zip(bars_pr, pr_coverage, pr_overlap):
+        label = f"{cov:.1f}% cov  (overlap {ov:.1f}%)"
+        ax_right.text(bar.get_width() + 1,
+                      bar.get_y() + bar.get_height() / 2,
+                      label, va="center", fontsize=6, color="black")
+
+    ax_right.set_yticks(pr_y)
+    ax_right.set_yticklabels(pr_labels, fontsize=6)
+    ax_right.invert_yaxis()
+    ax_right.set_xlabel("Coverage % (union / total)", fontsize=9)
+    ax_right.set_title("Best complementary pairs (high coverage, low overlap)",
+                       fontsize=10, fontweight="bold")
+    ax_right.set_xlim(0, max(pr_coverage) * 1.5 if pr_coverage else 100)
+
+    plt.tight_layout()
+    # Re-add inset axes after tight_layout may reposition
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved method breakdown chart to {output_path}")
 
 
 # ── Visualisation ────────────────────────────────────────────────────
@@ -4135,7 +4985,7 @@ def _compute_slope_profile_curvature_candidates(dem, valid, resolution,
 
 
 def _compute_alternative_candidates(dem, valid, resolution, transform,
-                                    sources=None):
+                                    sources=None, return_per_source=False):
     """Combine multiple alternative candidate sources via logical OR.
 
     Parameters
@@ -4147,6 +4997,17 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
         'ridge_crest', 'ml_probability', 'subtle_slope_break',
         'convexity_profile', 'gentle_slope_anomaly', 'multiscale_relief'.
         Values are booleans (enable/disable).
+    return_per_source : bool
+        If True, also return a dict of per-source boolean masks (same shape
+        as dem) so the caller can attribute each inferred point back to
+        the specific detector(s) that contributed it.
+
+    Returns
+    -------
+    combined : np.ndarray (H, W) bool
+        OR-combined candidate mask.
+    per_source : dict, optional (only if return_per_source=True)
+        {source_name: np.ndarray (H, W) bool} — one mask per source.
     """
     if sources is None:
         sources = {
@@ -4166,18 +5027,23 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
 
     h, w = dem.shape
     combined = np.zeros((h, w), dtype=bool)
+    per_source = {} if return_per_source else None
 
     # -- Existing sources (Phase 3) --
     if sources.get("curvature", False):
         curv_mask = _compute_multiscale_curvature_candidates(
             dem, valid, resolution, sigma_range=(1.0, 3.0, 5.0), percentile=90)
         combined |= curv_mask
+        if per_source is not None:
+            per_source["curvature"] = curv_mask
         print(f"    [Alt] Curvature candidates: {int(curv_mask.sum())} pixels")
 
     if sources.get("edge", False):
         edge_mask = _compute_edge_detection_candidates(
             dem, valid, resolution, sigma=2.0, percentile=88)
         combined |= edge_mask
+        if per_source is not None:
+            per_source["edge"] = edge_mask
         print(f"    [Alt] Edge detection candidates: {int(edge_mask.sum())} pixels")
 
     if sources.get("openness", False):
@@ -4185,12 +5051,16 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
             dem, valid, resolution, annulus_radii_m=(30.0, 60.0, 100.0),
             percentile=88)
         combined |= open_mask
+        if per_source is not None:
+            per_source["openness"] = open_mask
         print(f"    [Alt] Openness candidates: {int(open_mask.sum())} pixels")
 
     if sources.get("aspect", False):
         aspect_mask = _compute_aspect_change_candidates(
             dem, valid, resolution, sigma=3.0, percentile=90)
         combined |= aspect_mask
+        if per_source is not None:
+            per_source["aspect"] = aspect_mask
         print(f"    [Alt] Aspect change candidates: {int(aspect_mask.sum())} pixels")
 
     # -- New sources (10 methods) --
@@ -4198,6 +5068,8 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
         mask = _compute_adaptive_slope_candidates(
             dem, valid, resolution, window_m=150.0, k_std=2.0, percentile=90)
         combined |= mask
+        if per_source is not None:
+            per_source["adaptive_slope"] = mask
         print(f"    [Alt] Adaptive slope candidates: {int(mask.sum())} pixels")
 
     if sources.get("tpi", False):
@@ -4205,12 +5077,16 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
             dem, valid, resolution, window_sizes_m=(50.0, 100.0, 200.0),
             n_std=2.0, percentile=90)
         combined |= mask
+        if per_source is not None:
+            per_source["tpi"] = mask
         print(f"    [Alt] TPI candidates: {int(mask.sum())} pixels")
 
     if sources.get("tri", False):
         mask = _compute_tri_candidates(
             dem, valid, resolution, percentile=92)
         combined |= mask
+        if per_source is not None:
+            per_source["tri"] = mask
         print(f"    [Alt] TRI/Roughness candidates: {int(mask.sum())} pixels")
 
     if sources.get("dog", False):
@@ -4219,12 +5095,16 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
             sigma_pairs=((1.0, 3.0), (2.0, 5.0), (3.0, 7.0)),
             percentile=90)
         combined |= mask
+        if per_source is not None:
+            per_source["dog"] = mask
         print(f"    [Alt] DoG candidates: {int(mask.sum())} pixels")
 
     if sources.get("geomorphon", False):
         mask = _compute_geomorphon_candidates(
             dem, valid, resolution, flat_threshold=0.5)
         combined |= mask
+        if per_source is not None:
+            per_source["geomorphon"] = mask
         print(f"    [Alt] Geomorphon candidates: {int(mask.sum())} pixels")
 
     if sources.get("hough", False):
@@ -4232,6 +5112,8 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
             dem, valid, resolution, slope_threshold_deg=20.0,
             min_line_length_m=50.0, max_line_gap_m=20.0, dilate_px=5)
         combined |= mask
+        if per_source is not None:
+            per_source["hough"] = mask
         print(f"    [Alt] Hough lineament candidates: {int(mask.sum())} pixels")
 
     if sources.get("orientation", False):
@@ -4239,12 +5121,16 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
             dem, valid, resolution, window_m=100.0,
             min_slope_deg=5.0, max_circ_var=0.3, percentile=88)
         combined |= mask
+        if per_source is not None:
+            per_source["orientation"] = mask
         print(f"    [Alt] Orientation consistency candidates: {int(mask.sum())} pixels")
 
     if sources.get("phase_congruency", False):
         mask = _compute_phase_congruency_candidates(
             dem, valid, resolution, nscale=4, norient=6, percentile=90)
         combined |= mask
+        if per_source is not None:
+            per_source["phase_congruency"] = mask
         print(f"    [Alt] Phase congruency candidates: {int(mask.sum())} pixels")
 
     if sources.get("ridge_crest", False):
@@ -4252,6 +5138,8 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
             dem, valid, resolution, sigma_range=(1.0, 3.0, 5.0),
             percentile=90, nms_window=3)
         combined |= mask
+        if per_source is not None:
+            per_source["ridge_crest"] = mask
         print(f"    [Alt] Ridge crest candidates: {int(mask.sum())} pixels")
 
     if sources.get("ml_probability", False):
@@ -4259,6 +5147,8 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
             dem, valid, resolution, transform,
             threshold=0.5, percentile=None)
         combined |= mask
+        if per_source is not None:
+            per_source["ml_probability"] = mask
         print(f"    [Alt] ML probability candidates: {int(mask.sum())} pixels")
 
     # -- Subtle scarp feature detectors --
@@ -4268,6 +5158,8 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
             min_relief_m=0.5, max_relief_m=12.0,
             scarp_width_m=(50.0, 400.0), percentile=80)
         combined |= subtle_mask
+        if per_source is not None:
+            per_source["subtle_slope_break"] = subtle_mask
         print(f"    [Alt] Subtle slope break candidates: {int(subtle_mask.sum())} pixels")
 
     if sources.get("convexity_profile", False):
@@ -4275,6 +5167,8 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
             dem, valid, resolution,
             tolerance_m=5.0, percentile=88)
         combined |= convexity_mask
+        if per_source is not None:
+            per_source["convexity_profile"] = convexity_mask
         print(f"    [Alt] Convexity profile candidates: {int(convexity_mask.sum())} pixels")
 
     if sources.get("gentle_slope_anomaly", False):
@@ -4283,6 +5177,8 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
             base_slope_range=(0.003, 0.06),
             anomaly_threshold=1.1, percentile=75)
         combined |= gentle_mask
+        if per_source is not None:
+            per_source["gentle_slope_anomaly"] = gentle_mask
         print(f"    [Alt] Gentle slope anomaly candidates: {int(gentle_mask.sum())} pixels")
 
     if sources.get("multiscale_relief", False):
@@ -4290,6 +5186,8 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
             dem, valid, resolution,
             scales_m=(50.0, 100.0, 150.0, 250.0), percentile=88)
         combined |= relief_mask
+        if per_source is not None:
+            per_source["multiscale_relief"] = relief_mask
         print(f"    [Alt] Multi-scale relief candidates: {int(relief_mask.sum())} pixels")
 
     if sources.get("slope_profile_curvature", False):
@@ -4297,9 +5195,13 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
             dem, valid, resolution,
             profile_length_m=300.0, min_slope_change=0.003, percentile=80)
         combined |= spc_mask
+        if per_source is not None:
+            per_source["slope_profile_curvature"] = spc_mask
         print(f"    [Alt] Slope profile curvature candidates: {int(spc_mask.sum())} pixels")
 
     print(f"    [Alt] Combined alternative candidates: {int(combined.sum())} pixels")
+    if per_source is not None:
+        return combined, per_source
     return combined
 
 
@@ -4307,11 +5209,12 @@ def _compute_alternative_candidates(dem, valid, resolution, transform,
 
 def main():
     global TRACE_BUFFER_M, TRACE2_BUFFER_M, TUNING_N_TRIALS
+    global DEM_SOURCE_KEY, DEM_PATH, CSV_PATH, OUTPUT_DIR
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dem-source", default="lidar_0_5m",
-                        choices=["lidar_0_5m"],
-                        help="DEM source (currently only lidar_0_5m is supported)")
+                        choices=list(DEM_SOURCE_MAP.keys()),
+                        help="DEM source key (maps to the GeoTIFF in data/derivatives/)")
     parser.add_argument("--n-trials", type=int, default=TUNING_N_TRIALS,
                         help="Number of Optuna trials for parameter tuning")
     parser.add_argument("--skip-tuning", action="store_true",
@@ -4396,7 +5299,34 @@ def main():
     parser.add_argument("--tune-objective", type=str, default="candidate_coverage",
                         choices=["candidate_coverage", "f2"],
                         help="Tuning objective: candidate_coverage (Phase 2) or f2 (legacy)")
+
+    # Method breakdown only — skip full pipeline, just regenerate figure
+    parser.add_argument("--methodbreak", action="store_true",
+                        help="Skip the full pipeline and only regenerate the "
+                             "method_breakdown.png figure from an existing "
+                             "inference_quality.json. Requires --quality-json "
+                             "to point to a valid JSON file.")
+    parser.add_argument("--quality-json", type=str, default=None,
+                        help="Path to inference_quality.json (for use with --methodbreak)")
     args = parser.parse_args()
+
+    # ── Set DEM-source-dependent paths dynamically ────────────────
+    DEM_SOURCE_KEY = args.dem_source
+    DEM_PATH = OUT_DIR / DEM_SOURCE_MAP[DEM_SOURCE_KEY]
+    OUTPUT_DIR = OUT_DIR / "known_trace_scarp_validation" / DEM_SOURCE_KEY
+    CSV_PATH = OUTPUT_DIR / "all_inferred_points.csv"
+
+    # ── Method-breakdown-only mode: skip entire pipeline, just
+    # regenerate the figure from an existing inference_quality.json.
+    if args.methodbreak:
+        qjson_path = args.quality_json or str(OUTPUT_DIR / "inference_quality.json")
+        print(f"\n[Method Break] Loading quality data from {qjson_path}")
+        with open(qjson_path, "r") as f:
+            quality = json.load(f)
+        out_dir = Path(OUTPUT_DIR)
+        _plot_method_breakdown(quality, out_dir / "method_breakdown.png")
+        print(f"\n[Method Break] Done. Outputs in {out_dir}")
+        return
 
     TRACE_BUFFER_M = args.trace_buffer_m
     TRACE2_BUFFER_M = args.trace2_buffer_m
@@ -4493,7 +5423,14 @@ def main():
             params=DEFAULT_PARAMS.copy())
 
     # ── Phase 2 / Step 2: ML parameter tuning ─────────────────────
-    tuned_params = DEFAULT_PARAMS.copy()
+    # For coarse DEMs, use the coarse-DEM preset instead of the 10m-tuned defaults
+    with rasterio.open(DEM_PATH) as _src_res:
+        _dem_res = abs(_src_res.res[0])
+    if _dem_res > COARSE_DEM_THRESHOLD_M:
+        tuned_params = COARSE_DEM_PARAMS.copy()
+        print(f"  [Coarse DEM] Using coarse-DEM preset params (res={_dem_res:.1f}m)")
+    else:
+        tuned_params = DEFAULT_PARAMS.copy()
     best_f1 = 0.0
     results_log = []
 
@@ -4587,14 +5524,30 @@ def main():
     # ── Step 3: DEM-wide inference with tuned params ───────────────
     if args.phase in ("all", "3", "inference"):
         print(f"\n[Step 3] Running DEM-wide inference with tuned parameters...")
+
+        # For coarse DEMs (e.g. SRTM 90m), enable NFD1 seed injection and
+        # scale the trace proximity buffer to the DEM resolution.
+        use_nfd1_seeds = (DEM_SOURCE_KEY not in ("lidar_0_5m",))
+        if use_nfd1_seeds:
+            print(f"  [Coarse DEM] Enabling NFD1 seed injection for {DEM_SOURCE_KEY}")
+
+        # For coarse DEMs, scale the seed accept radius to the resolution
+        effective_seed_radius = args.fsd1_seed_accept_radius_m
+        if use_nfd1_seeds:
+            with rasterio.open(DEM_PATH) as _src_rad:
+                _dem_res_rad = abs(_src_rad.res[0])
+            effective_seed_radius = max(args.fsd1_seed_accept_radius_m, _dem_res_rad)
+            print(f"  [Coarse DEM] Seed accept radius: {args.fsd1_seed_accept_radius_m}m -> {effective_seed_radius}m")
+
         inferred_df = run_dem_wide_inference(
             DEM_PATH, tuned_params, smoothed_traces, out_dir,
             write_tiles=args.write_tiles, use_fsd1_seeds=use_fsd1_seeds,
             bounds=search_bounds,
-            seed_accept_radius_m=args.fsd1_seed_accept_radius_m,
+            seed_accept_radius_m=effective_seed_radius,
             alt_sources=alt_sources if args.phase in ("all", "3", "inference") else None,
             ml_probability_threshold=args.ml_probability_threshold,
-            ml_filter_mode=args.ml_filter_mode)
+            ml_filter_mode=args.ml_filter_mode,
+            use_nfd1_seeds=use_nfd1_seeds)
 
 
         if args.sensitivity:
@@ -4606,7 +5559,9 @@ def main():
 
         # ── Step 4: Evaluate quality ────────────────────────────────
         print(f"\n[Step 4] Evaluating inference quality...")
-        quality = _evaluate_inference_quality(inferred_df, smoothed_traces)
+        quality = _evaluate_inference_quality(
+            inferred_df, smoothed_traces,
+            alt_sources=alt_sources, tuned_params=tuned_params)
         print(f"  Recall:    {quality['recall']:.4f} "
               f"({quality['n_highcon_recovered']}/{quality['n_highcon_total']} ground truth points recovered)")
         print(f"  Precision: {quality['precision']:.4f}")
@@ -4620,16 +5575,69 @@ def main():
                 print(f"    FSD1 recovery: {stats['fsd1_recall']:.4f} "
                       f"({stats['n_fsd1_recovered']}/{stats['n_fsd1']} FSD1 pts)")
 
+        # Print NFD1 recovery stats if available
+        nfd1_stats = quality.get("nfd1", {})
+        if nfd1_stats:
+            print(f"  NFD1 recovery: {nfd1_stats['nfd1_recall']:.4f} "
+                  f"({nfd1_stats['n_nfd1_recovered']}/{nfd1_stats['n_nfd1_total']} NFD1 pts)")
+
+        # Print method breakdown
+        mb = quality.get("method_breakdown", {})
+        if mb:
+            n_total = mb.get("n_inferred_total", 0)
+            pp = mb.get("per_point_methods", {})
+            print(f"\n  ── Method Breakdown (n={n_total:,} inferred points) ──")
+            print(f"  Note: a point may be attributed to multiple methods.")
+            print(f"  Solo counts (points where the method contributed):")
+            # Sort by count descending
+            sorted_pp = sorted(pp.items(), key=lambda x: x[1]["n_points"],
+                               reverse=True)
+            print(f"  {'Method':<40s} {'Points':>8s} {'%':>7s}")
+            print(f"  {'-'*40} {'-'*8} {'-'*7}")
+            for mname, minfo in sorted_pp:
+                print(f"  {mname:<40s} {minfo['n_points']:>8,d} "
+                      f"{minfo['percentage']:>6.1f}%")
+
+            # Print top co-occurrences (top 10 pairs)
+            cooc = mb.get("co_occurrence_matrix", {})
+            if cooc:
+                mnames = cooc.get("method_names", [])
+                mat = cooc.get("matrix", {})
+                pairs = []
+                for i, mi in enumerate(mnames):
+                    for j, mj in enumerate(mnames):
+                        if j >= i:  # skip upper triangle (redundant)
+                            continue
+                        val = mat.get(mi, {}).get(mj, 0)
+                        if val > 0:
+                            pairs.append((mi, mj, val))
+                pairs.sort(key=lambda x: x[2], reverse=True)
+                if pairs:
+                    print(f"\n  Top method co-occurrences (points attributed to both):")
+                    print(f"  {'Method A':<40s} {'Method B':<40s} {'Points':>8s} {'%':>7s}")
+                    print(f"  {'-'*40} {'-'*40} {'-'*8} {'-'*7}")
+                    for mi, mj, val in pairs[:10]:
+                        pct = val / n_total * 100.0 if n_total > 0 else 0.0
+                        print(f"  {mi:<40s} {mj:<40s} {val:>8,d} {pct:>6.1f}%")
+
+            print(f"\n  Pipeline-level methods:")
+            for mname, minfo in mb.get("pipeline_methods", {}).items():
+                status = "ENABLED" if minfo["enabled"] else "DISABLED"
+                print(f"  {mname:<40s} {status}")
+
         quality_path = out_dir / "inference_quality.json"
         with open(quality_path, "w") as f:
             json.dump(quality, f, indent=2, default=str)
-        print(f"  Saved quality metrics to {quality_path}")
+        print(f"\n  Saved quality metrics to {quality_path}")
 
         # ── Step 5: Visualise results ───────────────────────────────
         print(f"\n[Step 5] Generating visualisations...")
         _plot_dem_wide_results(inferred_df, smoothed_traces, DEM_PATH,
                                out_dir / "dem_wide_inference_overview.png",
                                quality=quality, bounds=plot_bounds)
+
+        # Method breakdown chart + CSV
+        _plot_method_breakdown(quality, out_dir / "method_breakdown.png")
 
         # ── Summary ──────────────────────────────────────────────────
         print(f"\n{'#'*70}")

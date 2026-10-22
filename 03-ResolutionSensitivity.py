@@ -68,9 +68,10 @@ LIDAR_NODATA = -9999.0
 # -- External DEM sources (reprojected to EPSG:28355) --
 # These .tif files are produced by 01-DerivativeGen.py and represent
 # independent DEM acquisitions, NOT downscaled LiDAR.
-LIDAR_RP   = DERIV_DIR / "lidar_0_5m_epsg28355.tif"
-DEM10M_RP  = DERIV_DIR / "dem10m_epsg28355.tif"
-SRTM_RP    = DERIV_DIR / "srtm1s_epsg28355.tif"
+LIDAR_RP    = DERIV_DIR / "lidar_0_5m_epsg28355.tif"
+DEM10M_RP   = DERIV_DIR / "dem10m_epsg28355.tif"
+SRTM_RP     = DERIV_DIR / "srtm1s_epsg28355.tif"
+SRTM3S_RP   = DERIV_DIR / "srtm3s_epsg28355.tif"
 
 # Backward-compatible alias used in the original code
 LIDAR_RP_PATH = LIDAR_RP
@@ -80,16 +81,17 @@ STRUCT_PTS_PATH = DATA_DIR / "structural_points_inventory.csv"
 HS_AZIMUTHS = [315, 45, 135, 225]
 HS_ALTITUDE = 8
 
-# Only 5 resolutions: 0.5m (native LiDAR), 2m and 5m (downsampled from
-# LiDAR), 10m and 30m (from independent DEM .tif files).
-TARGET_RESOLUTIONS = [0.5, 2, 5, 10, 30]
+# Only 6 resolutions: 0.5m (native LiDAR), 2m and 5m (downsampled from
+# LiDAR), 10m and 30m (from independent DEM .tif files), 90m (SRTM 3s).
+TARGET_RESOLUTIONS = [0.5, 2, 5, 10, 30, 90]
 
-# Resolutions 10m and 30m come from external .tif files rather than
+# Resolutions 10m, 30m and 90m come from external .tif files rather than
 # downsampling the 0.5m LiDAR.  We store the mapping so the rest of the
 # pipeline can detect which source to read from.
 EXTERNAL_DEM_SOURCES = {
     10: DEM10M_RP,
     30: SRTM_RP,
+    90: SRTM3S_RP,
 }
 
 # Resampling algorithms are only applied to LiDAR-derived resolutions
@@ -2761,33 +2763,53 @@ def main():
     print("                              Sensitivity Analysis")
     print("=" * 80)
 
+    # ---- TEST MODE: only process SRTM 3s, skip all other resolutions ----
+    TEST_ONLY_SRTM3S = True
+
+    # In test mode, override resolutions to only 90m
+    if TEST_ONLY_SRTM3S:
+        _test_resolutions = [90]
+    else:
+        _test_resolutions = TARGET_RESOLUTIONS
+
     safe_makedirs(OUT_DIR)
 
     # ------------------------------------------------------------------
-    # Step 1: Determine LiDAR DEM extent and load structural points
+    # Step 1: Determine reference DEM extent and load structural points
     # ------------------------------------------------------------------
     print(f"\n--- Step 1: Load structural points and traces ---")
 
-    # Determine LiDAR path first (needed for extent filtering)
-    if not LIDAR_RP_PATH.exists():
-        print(f"  [!] Reprojected LiDAR not found: {LIDAR_RP_PATH}")
-        print(f"      Attempting to use any available LiDAR path ...")
-        alt_paths = list(DERIV_DIR.glob("lidar*epsg28355*.tif"))
-        if alt_paths:
-            lidar_path = alt_paths[0]
-            print(f"  Using: {lidar_path}")
-        else:
-            print("  [!] No LiDAR DEM found. Exiting.")
+    # Use SRTM 3s as reference in test mode; otherwise LiDAR
+    if TEST_ONLY_SRTM3S:
+        if not SRTM3S_RP.exists():
+            print(f"  [!] Reprojected SRTM 3s not found: {SRTM3S_RP}")
+            print("  [!] Run 01a-DerivativeGen.py first. Exiting.")
             return
+        ref_dem_path = SRTM3S_RP
+        ref_nodata = -32768.0
     else:
-        lidar_path = LIDAR_RP_PATH
+        # Determine LiDAR path first (needed for extent filtering)
+        if not LIDAR_RP_PATH.exists():
+            print(f"  [!] Reprojected LiDAR not found: {LIDAR_RP_PATH}")
+            print(f"      Attempting to use any available LiDAR path ...")
+            alt_paths = list(DERIV_DIR.glob("lidar*epsg28355*.tif"))
+            if alt_paths:
+                ref_dem_path = alt_paths[0]
+                print(f"  Using: {ref_dem_path}")
+            else:
+                print("  [!] No LiDAR DEM found. Exiting.")
+                return
+        else:
+            ref_dem_path = LIDAR_RP_PATH
+        ref_nodata = LIDAR_NODATA
 
-    # Read LiDAR DEM bounds for spatial filtering
-    lidar_extent = None
-    with rasterio.open(lidar_path) as src:
+    # Read reference DEM bounds for spatial filtering
+    ref_extent = None
+    with rasterio.open(ref_dem_path) as src:
         b = src.bounds
-        lidar_extent = (b.left, b.right, b.bottom, b.top)
-        print(f"  LiDAR DEM extent (EPSG:28355): "
+        ref_extent = (b.left, b.right, b.bottom, b.top)
+        print(f"  Reference DEM: {Path(ref_dem_path).name}")
+        print(f"  Extent (EPSG:28355): "
               f"E=[{b.left:.1f}, {b.right:.1f}], "
               f"N=[{b.bottom:.1f}, {b.top:.1f}]")
 
@@ -2795,23 +2817,23 @@ def main():
     traces = None
     if STRUCT_PTS_PATH.exists():
         struct_pts = load_structural_points(STRUCT_PTS_PATH,
-                                             dem_extent=lidar_extent)
+                                             dem_extent=ref_extent)
         traces = reconstruct_fault_traces(struct_pts,
                                            cluster_dist_m=30, min_pts=5)
 
-        # Filter traces: keep only those whose centroid falls within LiDAR extent
-        xmin, xmax, ymin, ymax = lidar_extent
+        # Filter traces: keep only those whose centroid falls within reference extent
+        xmin, xmax, ymin, ymax = ref_extent
         before = len(traces)
         traces = [t for t in traces
                   if xmin <= t["centroid_x"] <= xmax
                   and ymin <= t["centroid_y"] <= ymax]
         after = len(traces)
         if before != after:
-            print(f"  [Filter] Traces within LiDAR extent: "
+            print(f"  [Filter] Traces within reference extent: "
                   f"{after}/{before} (removed {before - after} out-of-extent)")
 
         print(f"  {len(struct_pts):,} structural points, "
-              f"{len(traces)} fault traces within LiDAR extent")
+              f"{len(traces)} fault traces within reference extent")
     else:
         print(f"  [!] Structural points file not found: {STRUCT_PTS_PATH}")
 
@@ -2840,19 +2862,19 @@ def main():
     # ------------------------------------------------------------------
     print(f"\n--- Step 3: Select test sites (high-class scarps) ---")
 
-    if lidar_extent is None:
-        print("  [!] No LiDAR extent available -- cannot select test sites")
+    if ref_extent is None:
+        print("  [!] No reference DEM extent available -- cannot select test sites")
         return
 
     test_sites = select_scarp_tiles(
-        class_df, traces, struct_pts, lidar_extent,
+        class_df, traces, struct_pts, ref_extent,
         n_tiles=N_TEST_SITES, tile_radius_m=SITE_RADIUS_M,
-        lidar_path=lidar_path, lidar_nodata=LIDAR_NODATA,
+        lidar_path=ref_dem_path, lidar_nodata=ref_nodata,
         validity_threshold=0.99
     )
 
     if len(test_sites) == 0:
-        print("  [!] No valid test sites within LiDAR extent -- exiting")
+        print("  [!] No valid test sites within reference extent -- exiting")
         return
 
     # Save test sites CSV
@@ -2865,7 +2887,7 @@ def main():
     # ------------------------------------------------------------------
     print(f"\n--- Step 4: Downsampling ---")
 
-    # lidar_path already determined in Step 1
+    # ref_dem_path already determined in Step 1
 
     # Check if we already have downsampled data
     # Invalidate cache if test_sites changed (different number of sites
@@ -2893,8 +2915,8 @@ def main():
         ds_results = pd.read_csv(ds_results_csv)
     else:
         ds_results = run_downsampling(
-            lidar_path, OUT_DIR, LIDAR_NODATA, test_sites,
-            TARGET_RESOLUTIONS
+            ref_dem_path, OUT_DIR, ref_nodata, test_sites,
+            _test_resolutions
         )
         ds_results.to_csv(ds_results_csv, index=False)
 
@@ -2907,7 +2929,7 @@ def main():
     ds_dir = OUT_DIR / "downsampled"
 
     for site_idx in test_sites.index:
-        for res in TARGET_RESOLUTIONS:
+        for res in _test_resolutions:
             for alg in get_algorithms_for_resolution(res):
                 stem = f"site_{site_idx}_res{res_tag(res)}_{alg}"
                 npy_path = ds_dir / f"{stem}.npy"
@@ -2917,7 +2939,7 @@ def main():
                     continue
 
                 generate_derivatives_at_resolution(
-                    npy_path, json_path, deriv_dir, LIDAR_NODATA
+                    npy_path, json_path, deriv_dir, ref_nodata
                 )
 
     # ------------------------------------------------------------------
@@ -2944,8 +2966,8 @@ def main():
     if metrics_df is None:
         try:
             metrics_df, detection_df = run_quantitative_metrics(
-                lidar_path, OUT_DIR, LIDAR_NODATA, test_sites,
-                traces, struct_pts, TARGET_RESOLUTIONS
+                ref_dem_path, OUT_DIR, ref_nodata, test_sites,
+                traces, struct_pts, _test_resolutions
             )
         except Exception as e:
             print(f"  [!] Step 6 FAILED: {type(e).__name__}: {e}")
@@ -2968,7 +2990,7 @@ def main():
         radius = site["radius"]
         qclass = site.get("quality_class", "") or ""
 
-        for res in TARGET_RESOLUTIONS:
+        for res in _test_resolutions:
             for alg in get_algorithms_for_resolution(res):
                 stem = f"site_{site_idx}_res{res_tag(res)}_{alg}"
                 npy_path = ds_dir / f"{stem}.npy"
@@ -2979,7 +3001,7 @@ def main():
 
                 dem_arr = np.load(npy_path).astype(np.float32)
                 plot_sensitivity_tile_panel(
-                    dem_arr, json_path, OUT_DIR, LIDAR_NODATA,
+                    dem_arr, json_path, OUT_DIR, ref_nodata,
                     struct_pts, traces, cx, cy, radius,
                     res, site_idx, quality_class=qclass
                 )
@@ -3002,10 +3024,7 @@ def main():
     for site_idx, site in test_sites.iterrows():
         # Build profiles_by_resolution from downsampled DEMs
         profiles_by_res = {}
-        for res in TARGET_RESOLUTIONS:
-            rep_alg = get_algorithms_for_resolution(res)[0]
-            npy_path = ds_dir / f"site_{site_idx}_res{res_tag(res)}_{rep_alg}.npy"
-            json_path = ds_dir / f"site_{site_idx}_res{res_tag(res)}_{rep_alg}.json"
+        for res in _test_resolutions:
             if not npy_path.exists():
                 continue
 
@@ -3035,14 +3054,14 @@ def main():
     for i, (_, site) in enumerate(test_sites.iterrows()):
         if i >= 2:  # first 2 sites only
             break
-        for res in [0.5, 2, 10]:
+        for res in _test_resolutions:
             rep_alg = get_algorithms_for_resolution(res)[0]
             npy_path = ds_dir / f"site_{site.name}_res{res_tag(res)}_{rep_alg}.npy"
             if not npy_path.exists():
                 continue
             plot_snr_spatial_variability(
-                OUT_DIR, lidar_path, res, traces, struct_pts,
-                LIDAR_NODATA,
+                OUT_DIR, ref_dem_path, res, traces, struct_pts,
+                ref_nodata,
                 (site["center_x"], site["center_y"]),
                 site["radius"]
             )
@@ -3065,7 +3084,7 @@ def main():
 
     if metrics_df is not None and len(metrics_df) > 0:
         run_uncertainty_assessment(
-            OUT_DIR, test_sites, TARGET_RESOLUTIONS, metrics_df
+            OUT_DIR, test_sites, _test_resolutions, metrics_df
         )
 
     # ------------------------------------------------------------------
@@ -3075,12 +3094,8 @@ def main():
     print("PHASE 2: RESOLUTION SENSITIVITY ANALYSIS COMPLETE")
     print(f"  Output directory: {OUT_DIR}")
     print(f"  Test sites: {len(test_sites)}")
-    print(f"  Resolutions tested: {TARGET_RESOLUTIONS}")
-    print(f"  LiDAR-derived resolutions: "
-          f"{[r for r in TARGET_RESOLUTIONS if not is_external_resolution(r)]}")
-    print(f"  External DEM sources: "
-          f"{[r for r in TARGET_RESOLUTIONS if is_external_resolution(r)]}")
-    print(f"  Resampling algorithms (LiDAR): {RESAMPLING_ALGORITHMS}")
+    print(f"  Resolutions tested: {_test_resolutions}")
+    print(f"  Reference DEM: {Path(ref_dem_path).name}")
     print(f"  Metrics computed: {len(metrics_df) if metrics_df is not None else 0} rows")
     print(f"{'='*80}")
 

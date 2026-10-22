@@ -21,16 +21,24 @@ from derivative_common import *
 def main():
     """Step 3-4: Tile sampling, visualisation, and Phase 1 audit."""
 
+    # ---- TEST MODE: only process SRTM 3s, skip all other DEMs ----
+    TEST_ONLY_SRTM3S = False
+
     tiles_dir = safe_makedirs(OUT_DIR / "tiles")
 
     # -- Reconstruct dems_to_process from existing files --
     dems_to_process = {}
 
-    for dem_key, label, default_nodata in [
+    _all_dems = [
+        ("srtm3s", "SRTM 3s (~90 m)", -32768.0),
         ("srtm1s", "SRTM 1s (~30 m)", -999.0),
         ("dem10m", "GA 10 m DEM", -3.4028234663852886e+38),
         ("lidar_0_5m", "LiDAR 0.5 m", -9999.0),
-    ]:
+    ]
+    if TEST_ONLY_SRTM3S:
+        _all_dems = [d for d in _all_dems if d[0] == "srtm3s"]
+
+    for dem_key, label, default_nodata in _all_dems:
         # Prefer clipped file if it exists
         clipped_path = OUT_DIR / f"{dem_key}_epsg28355_clipped.tif"
         unclipped_path = OUT_DIR / f"{dem_key}_epsg28355.tif"

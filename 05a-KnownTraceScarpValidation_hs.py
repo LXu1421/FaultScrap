@@ -2,11 +2,8 @@
 # -*- coding: utf-8 -*-
 """05a-KnownTraceScarpValidation.py -- known-trace, curvature-only scarp test.
 
-This deliberately does *not* import candidate tiles, an autoencoder, cosine
-similarities, or Script 05 picks.  It uses the same known-trace reconstruction,
-native LiDAR, HAND exclusion, TV scale space, and scarp dimensions as Script
-05, but asks the inverse question: which parts of a catalogued trace have an
-independently observable pixel-scale scarp base?
+It uses the same known-trace reconstruction, native LiDAR, HAND exclusion, TV scale space, and scarp dimensions as Script
+05, but asks the inverse question: which parts of a catalogued trace have an independently observable pixel-scale scarp base?
 
 Outputs are written to ``data/derivatives/known_trace_scarp_validation``.
 """
@@ -2091,7 +2088,7 @@ def _plot_summary(traces, segments, dem_path, out_path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dem-source", default="lidar_0_5m", choices=["lidar_0_5m", "dem10m", "srtm1s"])
+    parser.add_argument("--dem-source", default="lidar_0_5m", choices=["lidar_0_5m", "dem10m", "srtm1s", "srtm3s"])
     parser.add_argument("--buffer-m", type=float, default=FAULT_VALIDATION_TOLERANCE_M)
     parser.add_argument("--max-traces", type=int, default=None, help="Optional development limit.")
     parser.add_argument("--clip-points-to-dem", action="store_true",
@@ -2103,7 +2100,8 @@ def main():
     parser.add_argument("--write-local-lsm", action="store_true", help="Save one local LSM GeoTIFF per trace.")
     args = parser.parse_args()
     dem_name = {"lidar_0_5m": "lidar_0_5m_epsg28355_10m_smoke.tif", "dem10m": "dem10m_epsg28355_clipped.tif",
-                "srtm1s": "srtm1s_epsg28355_clipped.tif"}[args.dem_source]
+                "srtm1s": "srtm1s_epsg28355_clipped.tif",
+                "srtm3s": "srtm3s_epsg28355.tif"}[args.dem_source]
     dem_path = OUT_DIR / dem_name
     if not dem_path.exists():
         raise FileNotFoundError(f"DEM not found: {dem_path}")
